@@ -1,0 +1,6 @@
+build/
+errorck
+.cache
+.vscode
+*.jsonl
+!tests/**/expected.jsonl
