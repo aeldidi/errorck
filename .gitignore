@@ -4,3 +4,4 @@ errorck
 .vscode
 *.jsonl
 !tests/**/expected.jsonl
+Testing
