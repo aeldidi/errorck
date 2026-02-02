@@ -7,14 +7,14 @@ not as an interactive linter.
 
 ## Overview
 
-`errorck` analyzes calls to a fixed set of error-returning functions
-(hardcoded in the source for now) and classifies how each call’s return
+`errorck` analyzes calls to a user-supplied set of error-reporting functions
+(provided via `--notable-functions`) and classifies how each call’s return
 value is handled. It also detects simple one-layer wrapper functions that
 forward error codes (e.g. project-specific allocation wrappers) and treats
 calls through those wrappers equivalently.
 
-The tool emits machine-readable output suitable for ingestion into a
-database and later statistical analysis.
+The tool writes its output into a SQLite database suitable for later
+statistical analysis.
 
 ## What `errorck` detects
 
@@ -91,15 +91,24 @@ then build using `ninja`.
 
 ## Running
 
-`errorck` requires a compilation database.
+`errorck` requires a compilation database and a list of functions to watch.
 
-    $ `errorck` -p /path/to/build file1.c file2.cpp ...
+    $ `errorck` --notable-functions /path/to/functions.json \
+        --db results.sqlite -p /path/to/build file1.c file2.cpp ...
 
-Output is written to stdout as JSON Lines (one record per line).
+The functions file is a JSON array of objects with `name` and `reporting`
+fields. `reporting` must be either `return_value` or `errno`.
 
-Example:
+If the database path already exists, `errorck` exits with an error unless
+`--overwrite-if-needed` is provided to clobber it.
 
-    $ `errorck` -p . src/*.c > results.jsonl
+Results are written to the `watched_calls` table in the SQLite database with
+columns: `name`, `filename`, `line`, `column`, and `handling_type`.
+
+## Tests
+
+Test directories use prefixes: `fail_*` cases should produce findings, and
+`pass_*` cases should produce none.
 
 ## Intended use
 

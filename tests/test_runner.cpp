@@ -9,6 +9,7 @@
 #include <thread>
 #include <vector>
 
+#include "../sqlite3.h"
 #include "subprocess.h"
 
 namespace fs = std::filesystem;
@@ -198,6 +199,68 @@ static std::string NormalizeOutput(const std::string &output,
   return normalized;
 }
 
+static bool ReadDatabaseOutput(const fs::path &db_path, std::string &out,
+                               std::string &error) {
+  sqlite3 *db = nullptr;
+  int rc = sqlite3_open(db_path.string().c_str(), &db);
+  if (rc != SQLITE_OK) {
+    error = "Failed to open database: " +
+            std::string(db ? sqlite3_errmsg(db) : sqlite3_errstr(rc));
+    if (db) {
+      sqlite3_close(db);
+    }
+    return false;
+  }
+
+  // Order by row id so test output stays stable across runs.
+  const char *sql =
+      "SELECT name, filename, line, column, handling_type FROM watched_calls "
+      "ORDER BY id;";
+  sqlite3_stmt *stmt = nullptr;
+  rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+  if (rc != SQLITE_OK) {
+    error = "Failed to query database: " + std::string(sqlite3_errmsg(db));
+    sqlite3_close(db);
+    return false;
+  }
+
+  std::string result;
+  while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    const char *name =
+        reinterpret_cast<const char *>(sqlite3_column_text(stmt, 0));
+    const char *filename =
+        reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1));
+    int line = sqlite3_column_int(stmt, 2);
+    int column = sqlite3_column_int(stmt, 3);
+    const char *handling =
+        reinterpret_cast<const char *>(sqlite3_column_text(stmt, 4));
+
+    result += "{\"name\":\"";
+    result += name ? name : "";
+    result += "\",\"filename\":\"";
+    result += filename ? filename : "";
+    result += "\",\"line\":\"";
+    result += std::to_string(line);
+    result += "\",\"column\":\"";
+    result += std::to_string(column);
+    result += "\",\"handlingType\":\"";
+    result += handling ? handling : "";
+    result += "\"}\n";
+  }
+
+  if (rc != SQLITE_DONE) {
+    error = "Failed to read results: " + std::string(sqlite3_errmsg(db));
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return false;
+  }
+
+  sqlite3_finalize(stmt);
+  sqlite3_close(db);
+  out = result;
+  return true;
+}
+
 static std::vector<std::string> ReadCompileFlags(const fs::path &path) {
   std::ifstream in(path);
   std::vector<std::string> flags;
@@ -246,17 +309,19 @@ static std::string EscapeJson(const std::string &text) {
 static bool WriteCompileCommands(const fs::path &output_dir,
                                  const fs::path &test_dir,
                                  const std::vector<std::string> &flags) {
+  // ClangTool matches compile commands against absolute source paths.
+  fs::path directory = WeaklyCanonical(test_dir);
+  fs::path source_path = WeaklyCanonical(test_dir / "main.c");
   std::ostringstream json;
   json << "[\n  {\n";
-  json << "    \"directory\": \"" << EscapeJson(test_dir.string())
-       << "\",\n";
-  json << "    \"file\": \"main.c\",\n";
+  json << "    \"directory\": \"" << EscapeJson(directory.string()) << "\",\n";
+  json << "    \"file\": \"" << EscapeJson(source_path.string()) << "\",\n";
   json << "    \"arguments\": [";
   json << "\"clang\"";
   for (const std::string &flag : flags) {
     json << ", \"" << EscapeJson(flag) << "\"";
   }
-  json << ", \"-c\", \"main.c\"";
+  json << ", \"-c\", \"" << EscapeJson(source_path.string()) << "\"";
   json << "]\n  }\n]\n";
 
   fs::path output_path = output_dir / "compile_commands.json";
@@ -265,7 +330,8 @@ static bool WriteCompileCommands(const fs::path &output_dir,
 
 static bool RunDiff(const fs::path &expected_path,
                     const fs::path &actual_path) {
-  // Rely on diff(1) to keep the runner tiny while still showing a readable diff.
+  // Rely on diff(1) to keep the runner tiny while still showing a readable
+  // diff.
   std::string command = "diff -u " + QuoteForShell(expected_path.string()) +
                         " " + QuoteForShell(actual_path.string());
   return std::system(command.c_str()) == 0;
@@ -341,6 +407,7 @@ int main(int argc, char **argv) {
     fs::path main_path = test_dir / "main.c";
     fs::path flags_path = test_dir / "compile_flags.txt";
     fs::path expected_path = test_dir / "expected.jsonl";
+    fs::path notable_path = test_dir / "functions.json";
 
     if (!fs::exists(main_path, ec)) {
       std::cerr << "Missing main.c in " << test_dir << "\n";
@@ -354,6 +421,11 @@ int main(int argc, char **argv) {
     }
     if (!fs::exists(expected_path, ec)) {
       std::cerr << "Missing expected.jsonl in " << test_dir << "\n";
+      ++failures;
+      continue;
+    }
+    if (!fs::exists(notable_path, ec)) {
+      std::cerr << "Missing functions.json in " << test_dir << "\n";
       ++failures;
       continue;
     }
@@ -374,7 +446,14 @@ int main(int argc, char **argv) {
       continue;
     }
 
-    std::vector<std::string> command = {errorck_path.string(), "-p",
+    fs::path db_path = test_build_dir / "results.sqlite";
+    std::vector<std::string> command = {errorck_path.string(),
+                                        "--notable-functions",
+                                        notable_path.string(),
+                                        "--db",
+                                        db_path.string(),
+                                        "--overwrite-if-needed",
+                                        "-p",
                                         test_build_dir.string(),
                                         main_path.string()};
     CommandResult result = RunCommand(command);
@@ -391,7 +470,18 @@ int main(int argc, char **argv) {
       continue;
     }
 
-    std::string normalized = NormalizeOutput(result.stdout_output, test_dir);
+    std::string db_output;
+    std::string db_error;
+    if (!ReadDatabaseOutput(db_path, db_output, db_error)) {
+      std::cerr << "Failed to read database output for " << test_dir << "\n";
+      if (!db_error.empty()) {
+        std::cerr << db_error << "\n";
+      }
+      ++failures;
+      continue;
+    }
+
+    std::string normalized = NormalizeOutput(db_output, test_dir);
     EnsureTrailingNewline(normalized);
 
     std::string expected;

@@ -32,3 +32,9 @@ CMake is used to build the project. The build directory is called `build`, and
 is likely already generated. You can regenerate it if needed, but this fetches
 and build LLVM, which is a very large dependency and takes a long time to
 compile so you should try to avoid doing so.
+
+Test directories use prefixes: `fail_*` cases should produce findings, and
+`pass_*` cases should produce none.
+
+CHECKS.md should always be updated to reflect the logic used to perform the
+various checks.

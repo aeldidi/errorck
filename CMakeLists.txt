@@ -3,7 +3,7 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
 endif()
 
-project(errorck LANGUAGES CXX)
+project(errorck LANGUAGES C CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -53,6 +53,9 @@ if(NOT (LLVM_FOUND AND Clang_FOUND))
 endif()
 
 add_executable(errorck "${CMAKE_CURRENT_LIST_DIR}/main.cpp")
+add_library(sqlite3 STATIC "${CMAKE_CURRENT_LIST_DIR}/sqlite3.c")
+target_include_directories(sqlite3 PUBLIC ${CMAKE_CURRENT_LIST_DIR})
+target_link_libraries(errorck PRIVATE sqlite3)
 target_compile_options(errorck PRIVATE
     $<$<OR:$<CXX_COMPILER_ID:Clang>,$<CXX_COMPILER_ID:AppleClang>,$<CXX_COMPILER_ID:GNU>>:
     -Wall -Wextra>
@@ -126,7 +129,7 @@ enable_testing()
 add_executable(errorck_test_runner tests/test_runner.cpp)
 add_dependencies(errorck_test_runner errorck)
 find_package(Threads REQUIRED)
-target_link_libraries(errorck_test_runner PRIVATE Threads::Threads)
+target_link_libraries(errorck_test_runner PRIVATE sqlite3 Threads::Threads)
 add_test(
     NAME errorck_tests
     COMMAND errorck_test_runner
