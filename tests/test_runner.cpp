@@ -176,16 +176,26 @@ static std::string NormalizeOutput(const std::string &output,
     std::string line =
         output.substr(start, end == std::string::npos ? end : end - start);
 
-    const std::string needle = "\"filename\":\"";
+    const std::string needle = "\"filename\":";
     size_t key = line.find(needle);
-    if (key != std::string::npos) {
+    while (key != std::string::npos) {
       size_t value_start = key + needle.size();
-      size_t value_end = line.find('"', value_start);
-      if (value_end != std::string::npos) {
-        std::string path = line.substr(value_start, value_end - value_start);
-        std::string normalized_path = NormalizePath(path, test_dir);
-        line.replace(value_start, value_end - value_start, normalized_path);
+      while (value_start < line.size() && line[value_start] == ' ') {
+        ++value_start;
       }
+      if (value_start >= line.size() || line[value_start] != '"') {
+        key = line.find(needle, key + needle.size());
+        continue;
+      }
+      ++value_start;
+      size_t value_end = line.find('"', value_start);
+      if (value_end == std::string::npos) {
+        break;
+      }
+      std::string path = line.substr(value_start, value_end - value_start);
+      std::string normalized_path = NormalizePath(path, test_dir);
+      line.replace(value_start, value_end - value_start, normalized_path);
+      key = line.find(needle, value_start + normalized_path.size());
     }
 
     normalized += line;
@@ -214,7 +224,8 @@ static bool ReadDatabaseOutput(const fs::path &db_path, std::string &out,
 
   // Order by row id so test output stays stable across runs.
   const char *sql =
-      "SELECT name, filename, line, column, handling_type FROM watched_calls "
+      "SELECT name, filename, line, column, handling_type, "
+      "assigned_filename, assigned_line, assigned_column FROM watched_calls "
       "ORDER BY id;";
   sqlite3_stmt *stmt = nullptr;
   rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
@@ -234,6 +245,10 @@ static bool ReadDatabaseOutput(const fs::path &db_path, std::string &out,
     int column = sqlite3_column_int(stmt, 3);
     const char *handling =
         reinterpret_cast<const char *>(sqlite3_column_text(stmt, 4));
+    const char *assigned_filename =
+        reinterpret_cast<const char *>(sqlite3_column_text(stmt, 5));
+    int assigned_line = sqlite3_column_int(stmt, 6);
+    int assigned_column = sqlite3_column_int(stmt, 7);
 
     result += "{\"name\":\"";
     result += name ? name : "";
@@ -245,7 +260,18 @@ static bool ReadDatabaseOutput(const fs::path &db_path, std::string &out,
     result += std::to_string(column);
     result += "\",\"handlingType\":\"";
     result += handling ? handling : "";
-    result += "\"}\n";
+    result += "\"";
+    if (assigned_filename) {
+      result += ", \"assigned\": { \"filename\": \"";
+      result += assigned_filename;
+      result += "\", \"line\": \"";
+      result += std::to_string(assigned_line);
+      result += "\", \"column\": \"";
+      result += std::to_string(assigned_column);
+      result += "\" }";
+    }
+    result += "}";
+    result += "\n";
   }
 
   if (rc != SQLITE_DONE) {

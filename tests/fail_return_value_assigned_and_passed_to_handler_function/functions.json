@@ -1,0 +1,4 @@
+[
+  { "name": "malloc", "reporting": "return_value" },
+  { "name": "handle", "type": "handler" }
+]

@@ -1,0 +1,4 @@
+[
+  { "name": "strtoull", "reporting": "errno" },
+  { "name": "handle", "type": "handler" }
+]

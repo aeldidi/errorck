@@ -1,0 +1,1 @@
+{"name":"malloc","filename":"main.c","line":"5","column":"12","handlingType":"assigned_not_read", "assigned": { "filename": "main.c", "line": "6", "column": "16" }}

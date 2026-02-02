@@ -1,0 +1,4 @@
+[
+  { "name": "strtoull", "reporting": "errno" },
+  { "name": "log_errno", "type": "logger" }
+]

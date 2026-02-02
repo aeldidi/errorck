@@ -39,10 +39,12 @@ the handling into one of the following categories:
     	The return value is returned directly to the caller.
 
     used_other
-    	The return value is used in some other way (logging, passed to
-    	another function, etc.).
+    	The return value is passed to a handler or used in some other way.
 
-For reporting purposes, the following are considered “ignored” error
+    logged_not_handled
+    	The return value is logged but not otherwise handled.
+
+For reporting purposes, the following are considered "ignored" error
 conditions:
 
 - ignored
@@ -96,14 +98,18 @@ then build using `ninja`.
     $ `errorck` --notable-functions /path/to/functions.json \
         --db results.sqlite -p /path/to/build file1.c file2.cpp ...
 
-The functions file is a JSON array of objects with `name` and `reporting`
-fields. `reporting` must be either `return_value` or `errno`.
+The functions file is a JSON array. Entries describing error-reporting
+functions include `name` and `reporting` (either `return_value` or `errno`).
+Handler functions use `name` with `"type": "handler"` and omit `reporting`.
+Logger functions use `name` with `"type": "logger"` and omit `reporting`.
 
 If the database path already exists, `errorck` exits with an error unless
 `--overwrite-if-needed` is provided to clobber it.
 
 Results are written to the `watched_calls` table in the SQLite database with
-columns: `name`, `filename`, `line`, `column`, and `handling_type`.
+columns: `name`, `filename`, `line`, `column`, `handling_type`, and optional
+`assigned_filename`, `assigned_line`, `assigned_column` data for
+`assigned_not_read` findings.
 
 ## Tests
 
