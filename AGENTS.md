@@ -39,3 +39,6 @@ Test directories use prefixes: `fail_*` cases should produce findings, and
 CHECKS.md should always be updated to reflect the logic used to perform the
 various checks. Every check should have both pass and fail tests demonstrating
 their functionality.
+
+Keep the "Current status" section in README.md accurate and update its date
+whenever behavior or limitations change.

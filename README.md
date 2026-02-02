@@ -16,6 +16,22 @@ calls through those wrappers equivalently.
 The tool writes its output into a SQLite database suitable for later
 statistical analysis.
 
+## Current status
+
+- Implemented handling types: ignored, assigned_not_read, used_other (handler),
+  logged_not_handled (logger).
+- Handler/logger functions are declared in the notable functions JSON via
+  `"type": "handler"` or `"type": "logger"`.
+- Return-value tracking follows assignments within a compound statement;
+  handler use stops analysis, logger use does not.
+- Errno tracking is local to the call statement and the immediate next
+  statement; errno references are detected via `errno`, `__errno_location`, or
+  `__error`.
+- One-layer trivial wrappers are detected; no interprocedural dataflow or
+  function-pointer resolution.
+- Planned but not implemented: branched_no_catchall, branched_with_catchall,
+  propagated.
+
 ## What `errorck` detects
 
 For each call to a watched function (or trivial wrapper), `errorck` classifies
