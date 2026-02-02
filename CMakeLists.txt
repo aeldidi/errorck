@@ -10,9 +10,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(REQUIRED_LLVM_VERSION "18.1.8" CACHE STRING "Required LLVM/Clang version")
+set(REQUIRED_LLVM_VERSION "21.1.8" CACHE STRING "Required LLVM/Clang version")
 set(LLVM_ROOT "" CACHE PATH "Prefix containing lib/cmake/llvm and lib/cmake/clang")
-set(LLVM_TAG "llvmorg-18.1.8" CACHE STRING "llvm-project git tag/commit to fetch")
+set(LLVM_TAG "llvmorg-21.1.8" CACHE STRING "llvm-project git tag/commit to fetch")
 
 if(LLVM_ROOT)
     list(PREPEND CMAKE_PREFIX_PATH "${LLVM_ROOT}")

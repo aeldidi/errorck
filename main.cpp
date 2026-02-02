@@ -18,6 +18,7 @@
 #include "clang/Tooling/Tooling.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Error.h"
 
 #ifndef CLANG_RESOURCE_DIR
 #error "CLANG_RESOURCE_DIR must be defined by the build system."
@@ -191,7 +192,7 @@ static cl::OptionCategory Category("errorck options");
 int main(int argc, const char **argv) {
   auto pRes = CommonOptionsParser::create(argc, argv, Category);
   if (!pRes) {
-    llvm::errs() << pRes.takeError();
+    llvm::logAllUnhandledErrors(pRes.takeError(), llvm::errs());
     return EXIT_FAILURE;
   }
 
