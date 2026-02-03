@@ -18,19 +18,21 @@ statistical analysis.
 
 ## Current status
 
-- Implemented handling types: ignored, assigned_not_read, used_other (handler),
-  logged_not_handled (logger).
+_Last updated: 2026-02-03._
+
+- Implemented handling types: ignored, assigned_not_read, branched_no_catchall,
+  branched_with_catchall, used_other (handler), logged_not_handled (logger).
 - Handler/logger functions are declared in the notable functions JSON via
   `"type": "handler"` or `"type": "logger"`.
 - Return-value tracking follows assignments within a compound statement;
   handler use stops analysis, logger use does not.
 - Errno tracking is local to the call statement and the immediate next
-  statement; errno references are detected via `errno`, `__errno_location`, or
-  `__error`.
+  statement; if `errno` is assigned there, the assigned local is tracked within
+  the same compound statement. Errno references are detected via `errno`,
+  `__errno_location`, or `__error`.
 - One-layer trivial wrappers are detected; no interprocedural dataflow or
   function-pointer resolution.
-- Planned but not implemented: branched_no_catchall, branched_with_catchall,
-  propagated.
+- Planned but not implemented: propagated.
 
 ## What `errorck` detects
 

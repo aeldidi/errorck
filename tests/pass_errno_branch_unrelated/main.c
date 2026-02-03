@@ -1,13 +1,15 @@
 #include <errno.h>
 #include <stdlib.h>
 
-void log_errno(int value) { (void)value; }
-
-// The errno is logged and then handled without branching.
 int main() {
   unsigned long x = strtoull("", NULL, 10);
   int err = errno;
-  log_errno(err);
+  int flag = 0;
+  if (flag) {
+    flag = 1;
+  } else {
+    flag = 2;
+  }
   (void)err;
   return (int)x;
 }

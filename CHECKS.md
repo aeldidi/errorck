@@ -32,9 +32,10 @@ Example:
 
 ## Implemented checks
 
-`errorck` currently reports four handling types: `ignored`,
-`assigned_not_read`, `used_other`, and `logged_not_handled`. The meaning
-depends on the function’s `reporting` setting.
+`errorck` currently reports six handling types: `ignored`, `assigned_not_read`,
+`branched_no_catchall`, `branched_with_catchall`, `used_other`, and
+`logged_not_handled`. The meaning depends on the function’s `reporting`
+setting.
 
 ### ignored (return_value)
 
@@ -66,12 +67,51 @@ If the value is passed to a handler during this scan, the call is reported as
 `used_other`. If the value is passed to a logger and never otherwise handled in
 the same compound statement, the call is reported as `logged_not_handled`.
 
+### branched_no_catchall (return_value)
+
+For `reporting = return_value`, a call is reported as `branched_no_catchall`
+when its value is used in an `if` or `switch` condition and there is no
+catch-all branch.
+
+- `if` chains only count as catch-all when there is a final `else` that is not
+  another `if`.
+- `switch` statements only count as catch-all when they contain a `default`
+  label.
+
+### branched_with_catchall (return_value)
+
+For `reporting = return_value`, a call is reported as `branched_with_catchall`
+when its value is used in an `if` or `switch` condition and a catch-all branch
+is present (final `else` or `default`).
+
 ### assigned_not_read (errno)
 
 For `reporting = errno`, a call is reported as `assigned_not_read` when the
 statement containing the call or the immediately following statement assigns
 `errno` directly to a local variable, but that assigned value is never read in
 a non-assignment context within the same compound statement.
+
+### branched_no_catchall (errno)
+
+For `reporting = errno`, a call is reported as `branched_no_catchall` when an
+`if` or `switch` condition references `errno` in the call statement or the
+immediately following statement, and there is no catch-all branch.
+
+If `errno` is assigned to a local variable in the call statement or the
+immediately following statement, and a later `if`/`switch` condition uses that
+local within the same compound statement, the call is also reported as
+`branched_no_catchall`.
+
+### branched_with_catchall (errno)
+
+For `reporting = errno`, a call is reported as `branched_with_catchall` when an
+`if` or `switch` condition references `errno` in the call statement or the
+immediately following statement, and a catch-all branch is present.
+
+If `errno` is assigned to a local variable in the call statement or the
+immediately following statement, and a later `if`/`switch` condition uses that
+local within the same compound statement, the call is also reported as
+`branched_with_catchall`.
 
 ### used_other (handler)
 
@@ -86,6 +126,9 @@ If an error value is passed to a function declared as a logger (`type:
 otherwise handled within the same compound statement. Logging does not stop
 analysis: if the value is later handled, no `logged_not_handled` report is
 emitted.
+
+Branch detection takes priority over handler or logger detection when the error
+value is used in an `if` or `switch` condition.
 
 For `return_value`, direct uses are detected when the call result is passed as
 an argument to a handler or logger in the enclosing statement. For `errno`,

@@ -68,6 +68,8 @@ enum class HandlingType {
   kNone,
   kIgnored,
   kAssignedNotRead,
+  kBranchedNoCatchall,
+  kBranchedWithCatchall,
   kUsedOther,
   kLoggedNotHandled,
 };
@@ -96,6 +98,10 @@ static const char *HandlingTypeName(HandlingType type) {
     return "ignored";
   case HandlingType::kAssignedNotRead:
     return "assigned_not_read";
+  case HandlingType::kBranchedNoCatchall:
+    return "branched_no_catchall";
+  case HandlingType::kBranchedWithCatchall:
+    return "branched_with_catchall";
   case HandlingType::kUsedOther:
     return "used_other";
   case HandlingType::kLoggedNotHandled:
@@ -1023,6 +1029,8 @@ private:
     kPropagated,
     kKilled,
     kLogged,
+    kBranchedNoCatchall,
+    kBranchedWithCatchall,
     kUsedOther,
   };
 
@@ -1291,6 +1299,107 @@ private:
     return nullptr;
   }
 
+  HandlingType BranchHandlingType(bool has_catchall) const {
+    return has_catchall ? HandlingType::kBranchedWithCatchall
+                        : HandlingType::kBranchedNoCatchall;
+  }
+
+  bool IfHasCatchall(const clang::IfStmt *stmt) const {
+    const clang::IfStmt *current = stmt;
+    while (current) {
+      const clang::Stmt *else_stmt = current->getElse();
+      if (!else_stmt) {
+        return false;
+      }
+      if (const auto *else_if = llvm::dyn_cast<clang::IfStmt>(else_stmt)) {
+        current = else_if;
+        continue;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  bool SwitchHasDefault(const clang::SwitchStmt *stmt) const {
+    if (!stmt) {
+      return false;
+    }
+    for (const auto *case_stmt = stmt->getSwitchCaseList(); case_stmt;
+         case_stmt = case_stmt->getNextSwitchCase()) {
+      if (llvm::isa<clang::DefaultStmt>(case_stmt)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  std::optional<HandlingType>
+  BranchHandlingForCall(const clang::CallExpr *call_expr,
+                        clang::ASTContext &ctx) const {
+    const clang::Stmt *statement = FindStatementInCompound(call_expr, ctx);
+    if (!statement) {
+      return std::nullopt;
+    }
+
+    if (const auto *if_stmt = llvm::dyn_cast<clang::IfStmt>(statement)) {
+      if (ContainsCallReference(if_stmt->getCond(), call_expr)) {
+        return BranchHandlingType(IfHasCatchall(if_stmt));
+      }
+    }
+
+    if (const auto *switch_stmt =
+            llvm::dyn_cast<clang::SwitchStmt>(statement)) {
+      if (ContainsCallReference(switch_stmt->getCond(), call_expr)) {
+        return BranchHandlingType(SwitchHasDefault(switch_stmt));
+      }
+    }
+
+    return std::nullopt;
+  }
+
+  std::optional<HandlingType>
+  BranchHandlingForVarCondition(const clang::Stmt *stmt,
+                                const clang::VarDecl *var) const {
+    if (!stmt || !var) {
+      return std::nullopt;
+    }
+
+    if (const auto *if_stmt = llvm::dyn_cast<clang::IfStmt>(stmt)) {
+      if (ContainsVarReference(if_stmt->getCond(), var)) {
+        return BranchHandlingType(IfHasCatchall(if_stmt));
+      }
+    }
+
+    if (const auto *switch_stmt = llvm::dyn_cast<clang::SwitchStmt>(stmt)) {
+      if (ContainsVarReference(switch_stmt->getCond(), var)) {
+        return BranchHandlingType(SwitchHasDefault(switch_stmt));
+      }
+    }
+
+    return std::nullopt;
+  }
+
+  std::optional<HandlingType>
+  BranchHandlingForErrnoCondition(const clang::Stmt *stmt) const {
+    if (!stmt) {
+      return std::nullopt;
+    }
+
+    if (const auto *if_stmt = llvm::dyn_cast<clang::IfStmt>(stmt)) {
+      if (ContainsErrnoReference(if_stmt->getCond())) {
+        return BranchHandlingType(IfHasCatchall(if_stmt));
+      }
+    }
+
+    if (const auto *switch_stmt = llvm::dyn_cast<clang::SwitchStmt>(stmt)) {
+      if (ContainsErrnoReference(switch_stmt->getCond())) {
+        return BranchHandlingType(SwitchHasDefault(switch_stmt));
+      }
+    }
+
+    return std::nullopt;
+  }
+
   HandlingType DirectHandlerLoggerUse(const clang::CallExpr *call_expr,
                                       clang::ASTContext &ctx) const {
     const clang::CallExpr *enclosing =
@@ -1356,6 +1465,10 @@ private:
       return MakeResult(HandlingType::kIgnored);
     }
 
+    if (auto branched = BranchHandlingForCall(call_expr, ctx)) {
+      return MakeResult(*branched);
+    }
+
     HandlingType direct = DirectHandlerLoggerUse(call_expr, ctx);
     if (direct != HandlingType::kNone) {
       return MakeResult(direct);
@@ -1368,6 +1481,19 @@ private:
                               clang::ASTContext &ctx) const {
     if (IsErrnoIgnored(call_expr, ctx)) {
       return MakeResult(HandlingType::kIgnored);
+    }
+
+    const clang::Stmt *statement = FindStatementInCompound(call_expr, ctx);
+    if (statement) {
+      if (auto branched = BranchHandlingForErrnoCondition(statement)) {
+        return MakeResult(*branched);
+      }
+      const clang::Stmt *next = NextStatementInCompound(statement, ctx);
+      if (next) {
+        if (auto branched = BranchHandlingForErrnoCondition(next)) {
+          return MakeResult(*branched);
+        }
+      }
     }
 
     HandlingResult tracked =
@@ -1398,6 +1524,12 @@ private:
                                       clang::SourceLocation &out_loc) const {
     if (!stmt || !var) {
       return StatementUse::kNone;
+    }
+
+    if (auto branched = BranchHandlingForVarCondition(stmt, var)) {
+      return *branched == HandlingType::kBranchedWithCatchall
+                 ? StatementUse::kBranchedWithCatchall
+                 : StatementUse::kBranchedNoCatchall;
     }
 
     if (const auto *decl_stmt = llvm::dyn_cast<clang::DeclStmt>(stmt)) {
@@ -1530,6 +1662,16 @@ private:
       case StatementUse::kLogged:
         logged = true;
         break;
+      case StatementUse::kBranchedNoCatchall: {
+        TrackingResult result;
+        result.type = HandlingType::kBranchedNoCatchall;
+        return result;
+      }
+      case StatementUse::kBranchedWithCatchall: {
+        TrackingResult result;
+        result.type = HandlingType::kBranchedWithCatchall;
+        return result;
+      }
       case StatementUse::kUsedOther: {
         TrackingResult result;
         result.type = HandlingType::kUsedOther;

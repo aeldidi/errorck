@@ -2,12 +2,10 @@
 
 void log_error(void *p) { (void)p; }
 
-// The return value is logged and then handled.
+// The return value is logged and then handled without branching.
 int main() {
   void *p = malloc(10);
   log_error(p);
-  if (!p) {
-    return 1;
-  }
+  (void)p;
   return 0;
 }
