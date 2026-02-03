@@ -126,13 +126,4 @@ else()
 endif()
 
 enable_testing()
-add_executable(errorck_test_runner tests/test_runner.cpp)
-add_dependencies(errorck_test_runner errorck)
-find_package(Threads REQUIRED)
-target_link_libraries(errorck_test_runner PRIVATE sqlite3 Threads::Threads)
-add_test(
-    NAME errorck_tests
-    COMMAND errorck_test_runner
-        --build-dir ${CMAKE_BINARY_DIR}
-        --tests-dir ${CMAKE_SOURCE_DIR}/tests
-)
+add_subdirectory(tests)

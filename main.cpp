@@ -57,8 +57,6 @@ enum class ErrorReportingType {
 };
 
 using NotableFunctions = std::unordered_map<std::string, ErrorReportingType>;
-using HandlerFunctions = std::unordered_set<std::string>;
-using LoggerFunctions = std::unordered_set<std::string>;
 
 struct AssignedLocation {
   std::string filename;
@@ -109,8 +107,9 @@ static const char *HandlingTypeName(HandlingType type) {
 }
 
 static bool LoadNotableFunctions(const std::string &path, NotableFunctions &out,
-                                 HandlerFunctions &handlers,
-                                 LoggerFunctions &loggers, std::string &error) {
+                                 std::unordered_set<std::string> &handlers,
+                                 std::unordered_set<std::string> &loggers,
+                                 std::string &error) {
   std::ifstream in(path);
   if (!in) {
     error = "Failed to open notable functions file: " + path;
@@ -236,6 +235,8 @@ static bool IsErrnoExpr(const clang::Expr *expr) {
   return false;
 }
 
+// Visits a statement to see if "errno" or one of it's equivalent definitions
+// is present in it. The result is stored in `found`.
 class ErrnoReferenceVisitor
     : public clang::RecursiveASTVisitor<ErrnoReferenceVisitor> {
 public:
@@ -318,6 +319,8 @@ static const clang::DeclRefExpr *DirectVarReference(const clang::Expr *expr,
   return decl_ref;
 }
 
+// Visits an expression to see if it references a specific variable passed by
+// the caller and stores the result in `found_`.
 class VarReferenceVisitor
     : public clang::RecursiveASTVisitor<VarReferenceVisitor> {
 public:
@@ -349,6 +352,7 @@ static bool ContainsVarReference(const clang::Stmt *stmt,
   return found;
 }
 
+// Visits a statement to see if it contains a particular call expression.
 class CallReferenceVisitor
     : public clang::RecursiveASTVisitor<CallReferenceVisitor> {
 public:
@@ -398,10 +402,13 @@ struct VarUsageInfo {
   bool other = false;
 };
 
+// Visits an expression to record how a given variable is used, if at all.
 class VarUsageVisitor : public clang::RecursiveASTVisitor<VarUsageVisitor> {
 public:
-  VarUsageVisitor(const clang::VarDecl *var, const HandlerFunctions &handlers,
-                  const LoggerFunctions &loggers, VarUsageInfo &info)
+  VarUsageVisitor(const clang::VarDecl *var,
+                  const std::unordered_set<std::string> &handlers,
+                  const std::unordered_set<std::string> &loggers,
+                  VarUsageInfo &info)
       : var_(var), handlers_(handlers), loggers_(loggers), info_(info) {}
 
   bool TraverseCallExpr(clang::CallExpr *expr) {
@@ -468,16 +475,16 @@ private:
   }
 
   const clang::VarDecl *var_;
-  const HandlerFunctions &handlers_;
-  const LoggerFunctions &loggers_;
+  const std::unordered_set<std::string> &handlers_;
+  const std::unordered_set<std::string> &loggers_;
   VarUsageInfo &info_;
   std::vector<Context> context_stack_;
 };
 
-static VarUsageInfo AnalyzeVarUsage(const clang::Stmt *stmt,
-                                    const clang::VarDecl *var,
-                                    const HandlerFunctions &handlers,
-                                    const LoggerFunctions &loggers) {
+static VarUsageInfo
+AnalyzeVarUsage(const clang::Stmt *stmt, const clang::VarDecl *var,
+                const std::unordered_set<std::string> &handlers,
+                const std::unordered_set<std::string> &loggers) {
   VarUsageInfo info;
   if (!stmt || !var) {
     return info;
@@ -493,10 +500,12 @@ struct ErrnoUsageInfo {
   bool other = false;
 };
 
+// Visits an expression to record how errno is used, if at all.
 class ErrnoUsageVisitor : public clang::RecursiveASTVisitor<ErrnoUsageVisitor> {
 public:
-  ErrnoUsageVisitor(const HandlerFunctions &handlers,
-                    const LoggerFunctions &loggers, ErrnoUsageInfo &info)
+  ErrnoUsageVisitor(const std::unordered_set<std::string> &handlers,
+                    const std::unordered_set<std::string> &loggers,
+                    ErrnoUsageInfo &info)
       : handlers_(handlers), loggers_(loggers), info_(info) {}
 
   bool TraverseBinaryOperator(clang::BinaryOperator *op) {
@@ -581,15 +590,16 @@ private:
     }
   }
 
-  const HandlerFunctions &handlers_;
-  const LoggerFunctions &loggers_;
+  const std::unordered_set<std::string> &handlers_;
+  const std::unordered_set<std::string> &loggers_;
   ErrnoUsageInfo &info_;
   std::vector<Context> context_stack_;
 };
 
-static ErrnoUsageInfo AnalyzeErrnoUsage(const clang::Stmt *stmt,
-                                        const HandlerFunctions &handlers,
-                                        const LoggerFunctions &loggers) {
+static ErrnoUsageInfo
+AnalyzeErrnoUsage(const clang::Stmt *stmt,
+                  const std::unordered_set<std::string> &handlers,
+                  const std::unordered_set<std::string> &loggers) {
   ErrnoUsageInfo info;
   if (!stmt) {
     return info;
@@ -649,15 +659,15 @@ public:
     }
 
     const char *schema_sql = "CREATE TABLE IF NOT EXISTS watched_calls ("
-                             "id INTEGER PRIMARY KEY,"
-                             "name TEXT NOT NULL,"
-                             "filename TEXT NOT NULL,"
-                             "line INTEGER NOT NULL,"
-                             "column INTEGER NOT NULL,"
-                             "handling_type TEXT NOT NULL,"
-                             "assigned_filename TEXT,"
-                             "assigned_line INTEGER,"
-                             "assigned_column INTEGER"
+                             "    id INTEGER PRIMARY KEY,"
+                             "    name TEXT NOT NULL,"
+                             "    filename TEXT NOT NULL,"
+                             "    line INTEGER NOT NULL,"
+                             "    column INTEGER NOT NULL,"
+                             "    handling_type TEXT NOT NULL,"
+                             "    assigned_filename TEXT,"
+                             "    assigned_line INTEGER,"
+                             "    assigned_column INTEGER"
                              ");";
     char *errmsg = nullptr;
     rc = sqlite3_exec(db_, schema_sql, nullptr, nullptr, &errmsg);
@@ -779,8 +789,8 @@ private:
 class ErrorCheckVisitor : public clang::RecursiveASTVisitor<ErrorCheckVisitor> {
 public:
   ErrorCheckVisitor(const NotableFunctions &notable_functions,
-                    const HandlerFunctions &handler_functions,
-                    const LoggerFunctions &logger_functions,
+                    const std::unordered_set<std::string> &handler_functions,
+                    const std::unordered_set<std::string> &logger_functions,
                     SqliteWriter &writer)
       : notable_functions_(notable_functions),
         handler_functions_(handler_functions),
@@ -1557,16 +1567,16 @@ private:
   }
 
   const NotableFunctions &notable_functions_;
-  const HandlerFunctions &handler_functions_;
-  const LoggerFunctions &logger_functions_;
+  const std::unordered_set<std::string> &handler_functions_;
+  const std::unordered_set<std::string> &logger_functions_;
   SqliteWriter &writer_;
 };
 
 class ErrorCheckConsumer : public clang::ASTConsumer {
 public:
   ErrorCheckConsumer(const NotableFunctions &notable_functions,
-                     const HandlerFunctions &handler_functions,
-                     const LoggerFunctions &logger_functions,
+                     const std::unordered_set<std::string> &handler_functions,
+                     const std::unordered_set<std::string> &logger_functions,
                      SqliteWriter &writer)
       : Visitor(notable_functions, handler_functions, logger_functions,
                 writer) {}
@@ -1582,8 +1592,8 @@ private:
 class ErrorCheckAction : public clang::ASTFrontendAction {
 public:
   ErrorCheckAction(const NotableFunctions &notable_functions,
-                   const HandlerFunctions &handler_functions,
-                   const LoggerFunctions &logger_functions,
+                   const std::unordered_set<std::string> &handler_functions,
+                   const std::unordered_set<std::string> &logger_functions,
                    SqliteWriter &writer)
       : notable_functions_(notable_functions),
         handler_functions_(handler_functions),
@@ -1597,17 +1607,18 @@ public:
 
 private:
   const NotableFunctions &notable_functions_;
-  const HandlerFunctions &handler_functions_;
-  const LoggerFunctions &logger_functions_;
+  const std::unordered_set<std::string> &handler_functions_;
+  const std::unordered_set<std::string> &logger_functions_;
   SqliteWriter &writer_;
 };
 
 class ErrorCheckActionFactory : public clang::tooling::FrontendActionFactory {
 public:
-  ErrorCheckActionFactory(const NotableFunctions &notable_functions,
-                          const HandlerFunctions &handler_functions,
-                          const LoggerFunctions &logger_functions,
-                          SqliteWriter &writer)
+  ErrorCheckActionFactory(
+      const NotableFunctions &notable_functions,
+      const std::unordered_set<std::string> &handler_functions,
+      const std::unordered_set<std::string> &logger_functions,
+      SqliteWriter &writer)
       : notable_functions_(notable_functions),
         handler_functions_(handler_functions),
         logger_functions_(logger_functions), writer_(writer) {}
@@ -1619,8 +1630,8 @@ public:
 
 private:
   const NotableFunctions &notable_functions_;
-  const HandlerFunctions &handler_functions_;
-  const LoggerFunctions &logger_functions_;
+  const std::unordered_set<std::string> &handler_functions_;
+  const std::unordered_set<std::string> &logger_functions_;
   SqliteWriter &writer_;
 };
 
@@ -1644,8 +1655,8 @@ int main(int argc, const char **argv) {
   }
 
   NotableFunctions notable_functions;
-  HandlerFunctions handler_functions;
-  LoggerFunctions logger_functions;
+  std::unordered_set<std::string> handler_functions;
+  std::unordered_set<std::string> logger_functions;
   std::string error;
   if (!LoadNotableFunctions(NotableFunctionsPath, notable_functions,
                             handler_functions, logger_functions, error)) {

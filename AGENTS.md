@@ -8,6 +8,9 @@ maxphysaddr, don't call its cousin lowestaddress. Whenever there's a convention
 for something, follow it. The code should strive to be simple enough to be
 obviously bug free.
 
+Always document visitor classes, since they are usually unintuitive to see
+outside the context which it's used.
+
 When code appears non-trivial, include a comment above the non-trivial section
 explaining the "why", not the "what" behind the code, with any references where
 a developer can read more about why code does something.
@@ -34,7 +37,8 @@ and build LLVM, which is a very large dependency and takes a long time to
 compile so you should try to avoid doing so.
 
 Test directories use prefixes: `fail_*` cases should produce findings, and
-`pass_*` cases should produce none.
+`pass_*` cases should produce none. Tests are run using the `ctest` binary from
+within the `build` folder.
 
 CHECKS.md should always be updated to reflect the logic used to perform the
 various checks. Every check should have both pass and fail tests demonstrating

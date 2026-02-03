@@ -1,6 +1,4 @@
-#include <algorithm>
 #include <cstdio>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -19,21 +17,6 @@ struct CommandResult {
   std::string stdout_output;
   std::string stderr_output;
 };
-
-static std::string QuoteForShell(const std::string &arg) {
-  // Keep output readable while avoiding shell injection when paths contain
-  // spaces or quotes.
-  std::string quoted = "'";
-  for (char c : arg) {
-    if (c == '\'') {
-      quoted += "'\\''";
-    } else {
-      quoted += c;
-    }
-  }
-  quoted += "'";
-  return quoted;
-}
 
 static void ReadPipe(FILE *pipe, std::string *output) {
   char buffer[4096];
@@ -62,7 +45,8 @@ static CommandResult RunCommand(const std::vector<std::string> &args) {
   argv.push_back(nullptr);
 
   subprocess_s process = {};
-  int options = subprocess_option_inherit_environment;
+  int options = subprocess_option_inherit_environment |
+                subprocess_option_search_user_path;
   if (subprocess_create(argv.data(), options, &process) != 0) {
     result.exit_code = 127;
     result.stderr_output = "subprocess_create failed\n";
@@ -354,31 +338,37 @@ static bool WriteCompileCommands(const fs::path &output_dir,
   return WriteFile(output_path, json.str());
 }
 
-static bool RunDiff(const fs::path &expected_path,
-                    const fs::path &actual_path) {
-  // Rely on diff(1) to keep the runner tiny while still showing a readable
-  // diff.
-  std::string command = "diff -u " + QuoteForShell(expected_path.string()) +
-                        " " + QuoteForShell(actual_path.string());
-  return std::system(command.c_str()) == 0;
+static void PrintDiff(const fs::path &expected_path,
+                      const fs::path &actual_path) {
+  // Keep diff output readable without relying on a shell.
+  CommandResult diff =
+      RunCommand({"diff", "-u", expected_path.string(), actual_path.string()});
+  if (!diff.stdout_output.empty()) {
+    std::cerr << diff.stdout_output;
+  }
+  if (!diff.stderr_output.empty()) {
+    std::cerr << diff.stderr_output;
+  }
+  if (diff.exit_code == 127 || diff.exit_code > 1) {
+    std::cerr << "(diff command failed)\n";
+  }
 }
 
 static void PrintUsage(const char *argv0) {
   std::cerr << "Usage: " << argv0
-            << " --build-dir <path> [--tests-dir <path>] [test ...]\n";
+            << " --build-dir <path> --test-dir <path>\n";
 }
 
 int main(int argc, char **argv) {
   fs::path build_dir;
-  fs::path tests_dir = "tests";
-  std::vector<std::string> selected_tests;
+  fs::path test_dir;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
     if (arg == "--build-dir" && i + 1 < argc) {
       build_dir = argv[++i];
-    } else if (arg == "--tests-dir" && i + 1 < argc) {
-      tests_dir = argv[++i];
+    } else if (arg == "--test-dir" && i + 1 < argc) {
+      test_dir = argv[++i];
     } else if (arg == "--help" || arg == "-h") {
       PrintUsage(argv[0]);
       return 0;
@@ -387,7 +377,9 @@ int main(int argc, char **argv) {
       PrintUsage(argv[0]);
       return 2;
     } else {
-      selected_tests.push_back(arg);
+      std::cerr << "Unexpected argument: " << arg << "\n";
+      PrintUsage(argv[0]);
+      return 2;
     }
   }
 
@@ -397,9 +389,15 @@ int main(int argc, char **argv) {
     return 2;
   }
 
+  if (test_dir.empty()) {
+    std::cerr << "--test-dir is required.\n";
+    PrintUsage(argv[0]);
+    return 2;
+  }
+
   std::error_code ec;
-  if (!fs::exists(tests_dir, ec)) {
-    std::cerr << "Tests directory not found: " << tests_dir << "\n";
+  if (!fs::exists(test_dir, ec)) {
+    std::cerr << "Test directory not found: " << test_dir << "\n";
     return 2;
   }
 
@@ -409,136 +407,98 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  std::vector<fs::path> test_dirs;
-  if (!selected_tests.empty()) {
-    for (const std::string &name : selected_tests) {
-      test_dirs.push_back(tests_dir / name);
-    }
-  } else {
-    for (const auto &entry : fs::directory_iterator(tests_dir)) {
-      if (entry.is_directory()) {
-        test_dirs.push_back(entry.path());
-      }
-    }
-    std::sort(test_dirs.begin(), test_dirs.end());
+  fs::path main_path = test_dir / "main.c";
+  fs::path flags_path = test_dir / "compile_flags.txt";
+  fs::path expected_path = test_dir / "expected.jsonl";
+  fs::path notable_path = test_dir / "functions.json";
+
+  if (!fs::exists(main_path, ec)) {
+    std::cerr << "Missing main.c in " << test_dir << "\n";
+    return 1;
+  }
+  if (!fs::exists(flags_path, ec)) {
+    std::cerr << "Missing compile_flags.txt in " << test_dir << "\n";
+    return 1;
+  }
+  if (!fs::exists(expected_path, ec)) {
+    std::cerr << "Missing expected.jsonl in " << test_dir << "\n";
+    return 1;
+  }
+  if (!fs::exists(notable_path, ec)) {
+    std::cerr << "Missing functions.json in " << test_dir << "\n";
+    return 1;
   }
 
-  if (test_dirs.empty()) {
-    std::cerr << "No tests found.\n";
-    return 2;
+  std::vector<std::string> flags = ReadCompileFlags(flags_path);
+  fs::path test_build_dir = build_dir / "tests" / test_dir.filename();
+  fs::create_directories(test_build_dir, ec);
+  if (ec) {
+    std::cerr << "Failed to create build dir: " << test_build_dir << "\n";
+    return 1;
   }
 
-  int failures = 0;
-  for (const fs::path &test_dir : test_dirs) {
-    fs::path main_path = test_dir / "main.c";
-    fs::path flags_path = test_dir / "compile_flags.txt";
-    fs::path expected_path = test_dir / "expected.jsonl";
-    fs::path notable_path = test_dir / "functions.json";
-
-    if (!fs::exists(main_path, ec)) {
-      std::cerr << "Missing main.c in " << test_dir << "\n";
-      ++failures;
-      continue;
-    }
-    if (!fs::exists(flags_path, ec)) {
-      std::cerr << "Missing compile_flags.txt in " << test_dir << "\n";
-      ++failures;
-      continue;
-    }
-    if (!fs::exists(expected_path, ec)) {
-      std::cerr << "Missing expected.jsonl in " << test_dir << "\n";
-      ++failures;
-      continue;
-    }
-    if (!fs::exists(notable_path, ec)) {
-      std::cerr << "Missing functions.json in " << test_dir << "\n";
-      ++failures;
-      continue;
-    }
-
-    std::vector<std::string> flags = ReadCompileFlags(flags_path);
-    fs::path test_build_dir = build_dir / "tests" / test_dir.filename();
-    fs::create_directories(test_build_dir, ec);
-    if (ec) {
-      std::cerr << "Failed to create build dir: " << test_build_dir << "\n";
-      ++failures;
-      continue;
-    }
-
-    if (!WriteCompileCommands(test_build_dir, test_dir, flags)) {
-      std::cerr << "Failed to write compile_commands.json for " << test_dir
-                << "\n";
-      ++failures;
-      continue;
-    }
-
-    fs::path db_path = test_build_dir / "results.sqlite";
-    std::vector<std::string> command = {errorck_path.string(),
-                                        "--notable-functions",
-                                        notable_path.string(),
-                                        "--db",
-                                        db_path.string(),
-                                        "--overwrite-if-needed",
-                                        "-p",
-                                        test_build_dir.string(),
-                                        main_path.string()};
-    CommandResult result = RunCommand(command);
-    if (result.exit_code != 0) {
-      std::cerr << "errorck failed for " << test_dir << " (exit "
-                << result.exit_code << ")\n";
-      if (!result.stdout_output.empty()) {
-        std::cerr << result.stdout_output;
-      }
-      if (!result.stderr_output.empty()) {
-        std::cerr << result.stderr_output;
-      }
-      ++failures;
-      continue;
-    }
-
-    std::string db_output;
-    std::string db_error;
-    if (!ReadDatabaseOutput(db_path, db_output, db_error)) {
-      std::cerr << "Failed to read database output for " << test_dir << "\n";
-      if (!db_error.empty()) {
-        std::cerr << db_error << "\n";
-      }
-      ++failures;
-      continue;
-    }
-
-    std::string normalized = NormalizeOutput(db_output, test_dir);
-    EnsureTrailingNewline(normalized);
-
-    std::string expected;
-    if (!ReadFile(expected_path, expected)) {
-      std::cerr << "Failed to read expected output for " << test_dir << "\n";
-      ++failures;
-      continue;
-    }
-    EnsureTrailingNewline(expected);
-
-    if (normalized != expected) {
-      fs::path actual_path = test_build_dir / "actual.jsonl";
-      if (!WriteFile(actual_path, normalized)) {
-        std::cerr << "Failed to write actual output for " << test_dir << "\n";
-        ++failures;
-        continue;
-      }
-
-      std::cerr << "FAIL " << test_dir.filename().string() << "\n";
-      if (!RunDiff(expected_path, actual_path)) {
-        std::cerr << "(diff command failed)\n";
-      }
-      ++failures;
-    } else {
-      std::cout << "PASS " << test_dir.filename().string() << "\n";
-    }
+  if (!WriteCompileCommands(test_build_dir, test_dir, flags)) {
+    std::cerr << "Failed to write compile_commands.json for " << test_dir
+              << "\n";
+    return 1;
   }
 
-  if (failures > 0) {
-    std::cerr << failures << " test(s) failed.\n";
+  fs::path db_path = test_build_dir / "results.sqlite";
+  std::vector<std::string> command = {
+      errorck_path.string(),
+      "--notable-functions",
+      notable_path.string(),
+      "--db",
+      db_path.string(),
+      "--overwrite-if-needed",
+      "-p",
+      test_build_dir.string(),
+      main_path.string()};
+  CommandResult result = RunCommand(command);
+  if (result.exit_code != 0) {
+    std::cerr << "errorck failed for " << test_dir << " (exit "
+              << result.exit_code << ")\n";
+    if (!result.stdout_output.empty()) {
+      std::cerr << result.stdout_output;
+    }
+    if (!result.stderr_output.empty()) {
+      std::cerr << result.stderr_output;
+    }
+    return 1;
   }
 
-  return failures == 0 ? 0 : 1;
+  std::string db_output;
+  std::string db_error;
+  if (!ReadDatabaseOutput(db_path, db_output, db_error)) {
+    std::cerr << "Failed to read database output for " << test_dir << "\n";
+    if (!db_error.empty()) {
+      std::cerr << db_error << "\n";
+    }
+    return 1;
+  }
+
+  std::string normalized = NormalizeOutput(db_output, test_dir);
+  EnsureTrailingNewline(normalized);
+
+  std::string expected;
+  if (!ReadFile(expected_path, expected)) {
+    std::cerr << "Failed to read expected output for " << test_dir << "\n";
+    return 1;
+  }
+  EnsureTrailingNewline(expected);
+
+  if (normalized != expected) {
+    fs::path actual_path = test_build_dir / "actual.jsonl";
+    if (!WriteFile(actual_path, normalized)) {
+      std::cerr << "Failed to write actual output for " << test_dir << "\n";
+      return 1;
+    }
+
+    std::cerr << "FAIL " << test_dir.filename().string() << "\n";
+    PrintDiff(expected_path, actual_path);
+    return 1;
+  }
+
+  std::cout << "PASS " << test_dir.filename().string() << "\n";
+  return 0;
 }
