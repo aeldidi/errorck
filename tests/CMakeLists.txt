@@ -5,11 +5,13 @@ find_package(Threads REQUIRED)
 target_link_libraries(errorck_test_runner PRIVATE sqlite3 Threads::Threads)
 
 file(GLOB test_dirs RELATIVE ${CMAKE_CURRENT_LIST_DIR} CONFIGURE_DEPENDS
-     ${CMAKE_CURRENT_LIST_DIR}/pass_*
-     ${CMAKE_CURRENT_LIST_DIR}/fail_*)
+     ${CMAKE_CURRENT_LIST_DIR}/*)
 list(SORT test_dirs)
 
 foreach(test_dir IN LISTS test_dirs)
+  if (NOT IS_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}/${test_dir})
+    continue()
+  endif()
   add_test(
       NAME ${test_dir}
       COMMAND errorck_test_runner

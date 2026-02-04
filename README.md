@@ -16,24 +16,6 @@ calls through those wrappers equivalently.
 The tool writes its output into a SQLite database suitable for later
 statistical analysis.
 
-## Current status
-
-_Last updated: 2026-02-03._
-
-- Implemented handling types: ignored, assigned_not_read, branched_no_catchall,
-  branched_with_catchall, used_other (handler), logged_not_handled (logger).
-- Handler/logger functions are declared in the notable functions JSON via
-  `"type": "handler"` or `"type": "logger"`.
-- Return-value tracking follows assignments within a compound statement;
-  handler use stops analysis, logger use does not.
-- Errno tracking is local to the call statement and the immediate next
-  statement; if `errno` is assigned there, the assigned local is tracked within
-  the same compound statement. Errno references are detected via `errno`,
-  `__errno_location`, or `__error`.
-- One-layer trivial wrappers are detected; no interprocedural dataflow or
-  function-pointer resolution.
-- Planned but not implemented: propagated.
-
 ## What `errorck` detects
 
 For each call to a watched function (or trivial wrapper), `errorck` classifies
@@ -42,9 +24,13 @@ the handling into one of the following categories:
     ignored
     	The return value is discarded and not read.
 
+    cast_to_void
+    	The return value is explicitly discarded via a cast to void. This
+    	category applies to return-value reporting only.
+
     assigned_not_read
     	The return value is assigned to a local variable but never read,
-    	branched on, or returned.
+    	branched on, returned, logged, or passed to a handler.
 
     branched_no_catchall
     	The return value is used in an if or switch, but there is no
@@ -54,20 +40,22 @@ the handling into one of the following categories:
     	The return value is branched on and includes an else or default.
 
     propagated
-    	The return value is returned directly to the caller.
+    	The return value is returned to the caller, including return
+    	expressions that contain the error value.
+
+    passed_to_handler_fn
+    	The return value is passed to a handler function (any argument
+    	expression tree containing the error counts).
 
     used_other
-    	The return value is passed to a handler or used in some other way.
+    	The return value is used in some other way that does not match the
+    	categories above.
 
     logged_not_handled
     	The return value is logged but not otherwise handled.
 
-For reporting purposes, the following are considered "ignored" error
-conditions:
-
-- ignored
-- assigned_not_read
-- branched_no_catchall
+`errorck` always emits a row for each watched call. There is no pass/fail
+classification; interpretation is deferred to later analysis.
 
 ## Trivial wrapper detection
 
@@ -131,8 +119,8 @@ columns: `name`, `filename`, `line`, `column`, `handling_type`, and optional
 
 ## Tests
 
-Test directories use prefixes: `fail_*` cases should produce findings, and
-`pass_*` cases should produce none.
+Test directories are descriptive (no pass/fail prefix). Every test is expected
+to produce at least one row in the output database.
 
 ## Intended use
 

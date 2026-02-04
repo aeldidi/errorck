@@ -36,13 +36,12 @@ is likely already generated. You can regenerate it if needed, but this fetches
 and build LLVM, which is a very large dependency and takes a long time to
 compile so you should try to avoid doing so.
 
-Test directories use prefixes: `fail_*` cases should produce findings, and
-`pass_*` cases should produce none. Tests are run using the `ctest` binary from
+Test directories are descriptive (no pass/fail prefix) and each test should
+produce at least one finding. Tests are run using the `ctest` binary from
 within the `build` folder.
 
 CHECKS.md should always be updated to reflect the logic used to perform the
-various checks. Every check should have both pass and fail tests demonstrating
-their functionality.
+various checks. Every check should have tests demonstrating its functionality.
 
 Keep the "Current status" section in README.md accurate and update its date
 whenever behavior or limitations change.

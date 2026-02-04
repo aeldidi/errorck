@@ -355,8 +355,7 @@ static void PrintDiff(const fs::path &expected_path,
 }
 
 static void PrintUsage(const char *argv0) {
-  std::cerr << "Usage: " << argv0
-            << " --build-dir <path> --test-dir <path>\n";
+  std::cerr << "Usage: " << argv0 << " --build-dir <path> --test-dir <path>\n";
 }
 
 int main(int argc, char **argv) {
@@ -444,16 +443,15 @@ int main(int argc, char **argv) {
   }
 
   fs::path db_path = test_build_dir / "results.sqlite";
-  std::vector<std::string> command = {
-      errorck_path.string(),
-      "--notable-functions",
-      notable_path.string(),
-      "--db",
-      db_path.string(),
-      "--overwrite-if-needed",
-      "-p",
-      test_build_dir.string(),
-      main_path.string()};
+  std::vector<std::string> command = {errorck_path.string(),
+                                      "--notable-functions",
+                                      notable_path.string(),
+                                      "--db",
+                                      db_path.string(),
+                                      "--overwrite-if-needed",
+                                      "-p",
+                                      test_build_dir.string(),
+                                      main_path.string()};
   CommandResult result = RunCommand(command);
   if (result.exit_code != 0) {
     std::cerr << "errorck failed for " << test_dir << " (exit "

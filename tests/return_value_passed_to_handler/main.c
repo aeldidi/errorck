@@ -2,8 +2,7 @@
 
 void handle(void *p) { (void)p; }
 
-// Because the function is passed to another one which was registered as a
-// "handler", it's ok.
+// The return value is passed to a handler and reported as passed_to_handler_fn.
 int main() {
   void *p = malloc(10);
   handle(p);

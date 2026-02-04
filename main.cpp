@@ -67,9 +67,12 @@ struct AssignedLocation {
 enum class HandlingType {
   kNone,
   kIgnored,
+  kCastToVoid,
   kAssignedNotRead,
   kBranchedNoCatchall,
   kBranchedWithCatchall,
+  kPropagated,
+  kPassedToHandlerFn,
   kUsedOther,
   kLoggedNotHandled,
 };
@@ -96,12 +99,18 @@ static const char *HandlingTypeName(HandlingType type) {
   switch (type) {
   case HandlingType::kIgnored:
     return "ignored";
+  case HandlingType::kCastToVoid:
+    return "cast_to_void";
   case HandlingType::kAssignedNotRead:
     return "assigned_not_read";
   case HandlingType::kBranchedNoCatchall:
     return "branched_no_catchall";
   case HandlingType::kBranchedWithCatchall:
     return "branched_with_catchall";
+  case HandlingType::kPropagated:
+    return "propagated";
+  case HandlingType::kPassedToHandlerFn:
+    return "passed_to_handler_fn";
   case HandlingType::kUsedOther:
     return "used_other";
   case HandlingType::kLoggedNotHandled:
@@ -388,6 +397,81 @@ static bool ContainsCallReference(const clang::Stmt *stmt,
   CallReferenceVisitor visitor(call, found);
   visitor.TraverseStmt(const_cast<clang::Stmt *>(stmt));
   return found;
+}
+
+// Visits a statement to see if it returns a value containing a given variable.
+class ReturnVarVisitor : public clang::RecursiveASTVisitor<ReturnVarVisitor> {
+public:
+  ReturnVarVisitor(const clang::VarDecl *var, bool &found)
+      : var_(var), found_(found) {}
+
+  bool VisitReturnStmt(clang::ReturnStmt *stmt) {
+    if (found_) {
+      return false;
+    }
+    const clang::Expr *value = stmt->getRetValue();
+    if (value && ContainsVarReference(value, var_)) {
+      found_ = true;
+      return false;
+    }
+    return true;
+  }
+
+private:
+  const clang::VarDecl *var_;
+  bool &found_;
+};
+
+static bool ContainsReturnOfVar(const clang::Stmt *stmt,
+                                const clang::VarDecl *var) {
+  if (!stmt || !var) {
+    return false;
+  }
+  bool found = false;
+  ReturnVarVisitor visitor(var, found);
+  visitor.TraverseStmt(const_cast<clang::Stmt *>(stmt));
+  return found;
+}
+
+// Visits a statement to see if it returns a value containing errno.
+class ReturnErrnoVisitor
+    : public clang::RecursiveASTVisitor<ReturnErrnoVisitor> {
+public:
+  explicit ReturnErrnoVisitor(bool &found) : found_(found) {}
+
+  bool VisitReturnStmt(clang::ReturnStmt *stmt) {
+    if (found_) {
+      return false;
+    }
+    const clang::Expr *value = stmt->getRetValue();
+    if (value && ContainsErrnoReference(value)) {
+      found_ = true;
+      return false;
+    }
+    return true;
+  }
+
+private:
+  bool &found_;
+};
+
+static bool ContainsReturnOfErrno(const clang::Stmt *stmt) {
+  if (!stmt) {
+    return false;
+  }
+  bool found = false;
+  ReturnErrnoVisitor visitor(found);
+  visitor.TraverseStmt(const_cast<clang::Stmt *>(stmt));
+  return found;
+}
+
+static bool IsExplicitVoidCastExpr(const clang::Expr *expr) {
+  if (!expr) {
+    return false;
+  }
+  expr = expr->IgnoreParenImpCasts();
+  const auto *cast = llvm::dyn_cast<clang::ExplicitCastExpr>(expr);
+  return cast && cast->getType()->isVoidType();
 }
 
 static bool IsCallInSet(const clang::CallExpr *expr,
@@ -837,7 +921,7 @@ public:
         break;
       }
       if (handling.type == HandlingType::kNone) {
-        return RecursiveASTVisitor::TraverseStmt(S);
+        handling.type = HandlingType::kUsedOther;
       }
 
       auto loc = callExpr->getExprLoc();
@@ -853,6 +937,73 @@ public:
   }
 
 private:
+  const clang::Expr *TopLevelExpr(const clang::Expr *expr,
+                                  clang::ASTContext &ctx) const {
+    if (!expr) {
+      return nullptr;
+    }
+    const clang::Stmt *current = expr;
+    const clang::Expr *top = expr;
+    while (true) {
+      auto parents = ctx.getParents(*current);
+      if (parents.empty()) {
+        return top;
+      }
+      if (const auto *parent_expr = parents[0].get<clang::Expr>()) {
+        top = parent_expr;
+        current = parent_expr;
+        continue;
+      }
+      return top;
+    }
+  }
+
+  bool IsTopLevelExplicitVoidCast(const clang::Expr *expr,
+                                  clang::ASTContext &ctx) const {
+    const clang::Expr *top = TopLevelExpr(expr, ctx);
+    return top && IsExplicitVoidCastExpr(top);
+  }
+
+  bool IsReturnedCall(const clang::CallExpr *call_expr,
+                      clang::ASTContext &ctx) const {
+    if (!call_expr) {
+      return false;
+    }
+    const clang::Stmt *current = call_expr;
+    while (true) {
+      auto parents = ctx.getParents(*current);
+      if (parents.empty()) {
+        return false;
+      }
+      if (const auto *parent_expr = parents[0].get<clang::Expr>()) {
+        current = parent_expr;
+        continue;
+      }
+      if (const auto *parent_stmt = parents[0].get<clang::Stmt>()) {
+        const auto *return_stmt =
+            llvm::dyn_cast<clang::ReturnStmt>(parent_stmt);
+        if (!return_stmt) {
+          return false;
+        }
+        const clang::Expr *value = return_stmt->getRetValue();
+        return value && ContainsCallReference(value, call_expr);
+      }
+      return false;
+    }
+  }
+
+  bool IsExplicitVoidCastStatement(const clang::Stmt *stmt,
+                                   const clang::VarDecl *var) const {
+    if (!stmt || !var) {
+      return false;
+    }
+    const auto *expr = llvm::dyn_cast<clang::Expr>(stmt);
+    if (!expr || !IsExplicitVoidCastExpr(expr)) {
+      return false;
+    }
+    return ContainsVarReference(expr, var);
+  }
+
   // We only want calls whose values are unused, so walk up through expression
   // wrappers and accept statement-position contexts.
   bool IsIgnoredCallStatement(const clang::CallExpr *CallExpr,
@@ -873,7 +1024,15 @@ private:
         return false;
       }
 
-      if (llvm::isa<clang::Expr>(ParentStmt)) {
+      if (const auto *parent_expr = llvm::dyn_cast<clang::Expr>(ParentStmt)) {
+        bool is_wrapper =
+            llvm::isa<clang::ParenExpr, clang::ImplicitCastExpr,
+                      clang::ExplicitCastExpr, clang::ExprWithCleanups,
+                      clang::CXXBindTemporaryExpr,
+                      clang::MaterializeTemporaryExpr>(parent_expr);
+        if (!is_wrapper) {
+          return false;
+        }
         Current = ParentStmt;
         continue;
       }
@@ -1025,12 +1184,14 @@ private:
 
   enum class StatementUse {
     kNone,
-    kHandled,
-    kPropagated,
+    kPropagatedValue,
     kKilled,
     kLogged,
     kBranchedNoCatchall,
     kBranchedWithCatchall,
+    kPassedToHandlerFn,
+    kReturned,
+    kCastToVoid,
     kUsedOther,
   };
 
@@ -1146,7 +1307,7 @@ private:
     }
 
     return TrackAssignedValue(assignment_stmt, ctx, assigned_var,
-                              call_expr->getExprLoc());
+                              call_expr->getExprLoc(), true);
   }
 
   bool FindErrnoAssignmentInStatement(const clang::Stmt *stmt,
@@ -1239,7 +1400,8 @@ private:
       return {};
     }
 
-    return TrackAssignedValue(assignment_stmt, ctx, assigned_var, assigned_loc);
+    return TrackAssignedValue(assignment_stmt, ctx, assigned_var, assigned_loc,
+                              false);
   }
 
   const clang::CallExpr *
@@ -1408,7 +1570,7 @@ private:
       return HandlingType::kNone;
     }
     if (IsHandlerCall(enclosing)) {
-      return HandlingType::kUsedOther;
+      return HandlingType::kPassedToHandlerFn;
     }
     if (IsLoggerCall(enclosing)) {
       return HandlingType::kLoggedNotHandled;
@@ -1416,41 +1578,40 @@ private:
     return HandlingType::kNone;
   }
 
-  HandlingType FindErrnoDirectHandling(const clang::CallExpr *call_expr,
-                                       clang::ASTContext &ctx) const {
-    const clang::Stmt *statement = FindStatementInCompound(call_expr, ctx);
-    if (!statement) {
+  HandlingType AnalyzeErrnoStatement(const clang::Stmt *stmt,
+                                     bool &logged) const {
+    if (!stmt) {
       return HandlingType::kNone;
     }
 
-    bool logged = false;
     ErrnoUsageInfo usage =
-        AnalyzeErrnoUsage(statement, handler_functions_, logger_functions_);
+        AnalyzeErrnoUsage(stmt, handler_functions_, logger_functions_);
     if (usage.handler) {
-      return HandlingType::kUsedOther;
+      return HandlingType::kPassedToHandlerFn;
     }
-    if (usage.other) {
+    if (ContainsReturnOfErrno(stmt)) {
+      return HandlingType::kPropagated;
+    }
+    if (auto branched = BranchHandlingForErrnoCondition(stmt)) {
+      return *branched;
+    }
+
+    const clang::VarDecl *assigned_var = nullptr;
+    clang::SourceLocation assigned_loc;
+    if (FindErrnoAssignmentInStatement(stmt, assigned_var, assigned_loc)) {
+      if (usage.logger) {
+        logged = true;
+      }
       return HandlingType::kNone;
+    }
+
+    if (usage.other) {
+      return HandlingType::kUsedOther;
     }
     if (usage.logger) {
       logged = true;
     }
-
-    const clang::Stmt *next = NextStatementInCompound(statement, ctx);
-    if (next) {
-      usage = AnalyzeErrnoUsage(next, handler_functions_, logger_functions_);
-      if (usage.handler) {
-        return HandlingType::kUsedOther;
-      }
-      if (usage.other) {
-        return HandlingType::kNone;
-      }
-      if (usage.logger) {
-        logged = true;
-      }
-    }
-
-    return logged ? HandlingType::kLoggedNotHandled : HandlingType::kNone;
+    return HandlingType::kNone;
   }
 
   HandlingResult MakeResult(HandlingType type) const {
@@ -1461,12 +1622,8 @@ private:
 
   HandlingResult AnalyzeReturnValue(const clang::CallExpr *call_expr,
                                     clang::ASTContext &ctx) const {
-    if (IsIgnoredCallStatement(call_expr, ctx)) {
-      return MakeResult(HandlingType::kIgnored);
-    }
-
-    if (auto branched = BranchHandlingForCall(call_expr, ctx)) {
-      return MakeResult(*branched);
+    if (IsTopLevelExplicitVoidCast(call_expr, ctx)) {
+      return MakeResult(HandlingType::kCastToVoid);
     }
 
     HandlingType direct = DirectHandlerLoggerUse(call_expr, ctx);
@@ -1474,7 +1631,25 @@ private:
       return MakeResult(direct);
     }
 
-    return ToHandlingResult(TrackReturnValue(call_expr, ctx), ctx);
+    if (IsIgnoredCallStatement(call_expr, ctx)) {
+      return MakeResult(HandlingType::kIgnored);
+    }
+
+    if (IsReturnedCall(call_expr, ctx)) {
+      return MakeResult(HandlingType::kPropagated);
+    }
+
+    if (auto branched = BranchHandlingForCall(call_expr, ctx)) {
+      return MakeResult(*branched);
+    }
+
+    HandlingResult tracked =
+        ToHandlingResult(TrackReturnValue(call_expr, ctx), ctx);
+    if (tracked.type != HandlingType::kNone) {
+      return tracked;
+    }
+
+    return MakeResult(HandlingType::kUsedOther);
   }
 
   HandlingResult AnalyzeErrno(const clang::CallExpr *call_expr,
@@ -1484,15 +1659,16 @@ private:
     }
 
     const clang::Stmt *statement = FindStatementInCompound(call_expr, ctx);
-    if (statement) {
-      if (auto branched = BranchHandlingForErrnoCondition(statement)) {
-        return MakeResult(*branched);
-      }
-      const clang::Stmt *next = NextStatementInCompound(statement, ctx);
-      if (next) {
-        if (auto branched = BranchHandlingForErrnoCondition(next)) {
-          return MakeResult(*branched);
-        }
+    bool logged = false;
+    HandlingType direct = AnalyzeErrnoStatement(statement, logged);
+    if (direct != HandlingType::kNone) {
+      return MakeResult(direct);
+    }
+    const clang::Stmt *next = NextStatementInCompound(statement, ctx);
+    if (next) {
+      direct = AnalyzeErrnoStatement(next, logged);
+      if (direct != HandlingType::kNone) {
+        return MakeResult(direct);
       }
     }
 
@@ -1502,12 +1678,11 @@ private:
       return tracked;
     }
 
-    HandlingType direct = FindErrnoDirectHandling(call_expr, ctx);
-    if (direct != HandlingType::kNone) {
-      return MakeResult(direct);
+    if (logged) {
+      return MakeResult(HandlingType::kLoggedNotHandled);
     }
 
-    return {};
+    return MakeResult(HandlingType::kUsedOther);
   }
 
   bool IsHandlerCall(const clang::CallExpr *call_expr) const {
@@ -1521,9 +1696,20 @@ private:
   StatementUse AnalyzeStatementForVar(const clang::Stmt *stmt,
                                       const clang::VarDecl *var,
                                       const clang::VarDecl *&out_var,
-                                      clang::SourceLocation &out_loc) const {
+                                      clang::SourceLocation &out_loc,
+                                      bool allow_cast_to_void) const {
     if (!stmt || !var) {
       return StatementUse::kNone;
+    }
+
+    VarUsageInfo usage =
+        AnalyzeVarUsage(stmt, var, handler_functions_, logger_functions_);
+    if (usage.handler) {
+      return StatementUse::kPassedToHandlerFn;
+    }
+
+    if (ContainsReturnOfVar(stmt, var)) {
+      return StatementUse::kReturned;
     }
 
     if (auto branched = BranchHandlingForVarCondition(stmt, var)) {
@@ -1550,29 +1736,29 @@ private:
         const auto *direct = DirectVarReference(init, var);
         if (direct && var_decl->hasLocalStorage()) {
           if (candidate && candidate != var_decl) {
-            return StatementUse::kHandled;
+            return StatementUse::kUsedOther;
           }
           candidate = var_decl;
           candidate_loc = direct->getExprLoc();
           continue;
         }
-        VarUsageInfo usage =
+        VarUsageInfo init_usage =
             AnalyzeVarUsage(init, var, handler_functions_, logger_functions_);
-        if (usage.handler) {
+        if (init_usage.handler) {
+          return StatementUse::kPassedToHandlerFn;
+        }
+        if (init_usage.other) {
           return StatementUse::kUsedOther;
         }
-        if (usage.other) {
-          return StatementUse::kHandled;
-        }
-        if (usage.logger) {
+        if (init_usage.logger) {
           return StatementUse::kLogged;
         }
-        return StatementUse::kHandled;
+        return StatementUse::kUsedOther;
       }
       if (candidate) {
         out_var = candidate;
         out_loc = candidate_loc;
-        return StatementUse::kPropagated;
+        return StatementUse::kPropagatedValue;
       }
     }
 
@@ -1588,31 +1774,31 @@ private:
           if (direct && lhs_var && lhs_var != var) {
             out_var = lhs_var;
             out_loc = direct->getExprLoc();
-            return StatementUse::kPropagated;
+            return StatementUse::kPropagatedValue;
           }
-          VarUsageInfo usage = AnalyzeVarUsage(
+          VarUsageInfo rhs_usage = AnalyzeVarUsage(
               binop->getRHS(), var, handler_functions_, logger_functions_);
-          if (usage.handler) {
+          if (rhs_usage.handler) {
+            return StatementUse::kPassedToHandlerFn;
+          }
+          if (rhs_usage.other) {
             return StatementUse::kUsedOther;
           }
-          if (usage.other) {
-            return StatementUse::kHandled;
-          }
-          if (usage.logger) {
+          if (rhs_usage.logger) {
             return StatementUse::kLogged;
           }
-          return StatementUse::kHandled;
+          return StatementUse::kUsedOther;
         }
       }
     }
 
-    VarUsageInfo usage =
-        AnalyzeVarUsage(stmt, var, handler_functions_, logger_functions_);
-    if (usage.handler) {
-      return StatementUse::kUsedOther;
+    if (IsExplicitVoidCastStatement(stmt, var)) {
+      return allow_cast_to_void ? StatementUse::kCastToVoid
+                                : StatementUse::kUsedOther;
     }
+
     if (usage.other) {
-      return StatementUse::kHandled;
+      return StatementUse::kUsedOther;
     }
     if (usage.logger) {
       return StatementUse::kLogged;
@@ -1624,7 +1810,8 @@ private:
   TrackingResult TrackAssignedValue(const clang::Stmt *statement,
                                     clang::ASTContext &ctx,
                                     const clang::VarDecl *var,
-                                    clang::SourceLocation assigned_loc) const {
+                                    clang::SourceLocation assigned_loc,
+                                    bool allow_cast_to_void) const {
     // Keep the scan local and linear so we don't imply dataflow across blocks.
     // TODO: Add control-flow-aware tracking so uses across branches aren't
     // misclassified as unread.
@@ -1656,7 +1843,8 @@ private:
 
       const clang::VarDecl *next_var = nullptr;
       clang::SourceLocation next_loc;
-      switch (AnalyzeStatementForVar(*it, current_var, next_var, next_loc)) {
+      switch (AnalyzeStatementForVar(*it, current_var, next_var, next_loc,
+                                     allow_cast_to_void)) {
       case StatementUse::kNone:
         break;
       case StatementUse::kLogged:
@@ -1672,14 +1860,27 @@ private:
         result.type = HandlingType::kBranchedWithCatchall;
         return result;
       }
+      case StatementUse::kPassedToHandlerFn: {
+        TrackingResult result;
+        result.type = HandlingType::kPassedToHandlerFn;
+        return result;
+      }
+      case StatementUse::kReturned: {
+        TrackingResult result;
+        result.type = HandlingType::kPropagated;
+        return result;
+      }
+      case StatementUse::kCastToVoid: {
+        TrackingResult result;
+        result.type = HandlingType::kCastToVoid;
+        return result;
+      }
       case StatementUse::kUsedOther: {
         TrackingResult result;
         result.type = HandlingType::kUsedOther;
         return result;
       }
-      case StatementUse::kHandled:
-        return {};
-      case StatementUse::kPropagated:
+      case StatementUse::kPropagatedValue:
         current_var = next_var;
         current_loc = next_loc;
         break;

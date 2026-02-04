@@ -1,0 +1,3 @@
+[
+  { "name": "malloc", "reporting": "return_value" }
+]

@@ -1,4 +1,0 @@
-[
-  { "name": "malloc", "reporting": "return_value" },
-  { "name": "log_error", "type": "logger" }
-]
