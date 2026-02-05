@@ -80,7 +80,7 @@ Current limitations include:
 
 - One-layer wrapper detection only
 - No interprocedural dataflow
-- No function pointer resolution
+- Limited function pointer naming (direct member access only)
 - Simplified wrapper body patterns (single return, single result variable)
 - Catch-all detection limited to else/default
 - Analysis is per-translation-unit
@@ -104,6 +104,14 @@ then build using `ninja`.
 `errorck` requires a compilation database and a list of functions to watch.
 
     $ `errorck` --notable-functions /path/to/functions.json \
+        --db results.sqlite -p /path/to/build file1.c file2.cpp ...
+
+If you need extra compiler arguments applied to every file, provide a
+`compile_flags.txt` file (one argument per line, `#` comments ignored) and pass
+it with `--compile-flags`:
+
+    $ `errorck` --notable-functions /path/to/functions.json \
+        --compile-flags /path/to/compile_flags.txt \
         --db results.sqlite -p /path/to/build file1.c file2.cpp ...
 
 Additional selection examples:
@@ -132,6 +140,16 @@ functions include `name` and `reporting` (either `return_value` or `errno`).
 Handler functions use `name` with `"type": "handler"` and omit `reporting`.
 Logger functions use `name` with `"type": "logger"` and omit `reporting`.
 
+Schema (informal):
+
+```json
+[
+  {"name": "fn", "reporting": "return_value" | "errno"},
+  {"name": "handler_fn", "type": "handler"},
+  {"name": "logger_fn", "type": "logger"}
+]
+```
+
 If the database path already exists, `errorck` exits with an error unless
 `--overwrite-if-needed` is provided to clobber it.
 
@@ -140,27 +158,49 @@ columns: `name`, `filename`, `line`, `column`, `handling_type`, and optional
 `assigned_filename`, `assigned_line`, `assigned_column` data for
 `assigned_not_read` findings.
 
-## Tests
+## FAQ
 
-Test directories are descriptive (no pass/fail prefix). Every test is expected
-to produce at least one row in the output database.
+**Why am I seeing `<dynamic function call>` in my report?**
+
+`errorck` uses the callee name when it can be determined directly (including
+struct member function pointers like `ops.foo()`, which as an example would be
+reported as `foo`), but some indirect calls don't have a stable identifier,
+in cases like `(*get_func())()`. For those, the call is reported with the
+placeholder name `<dynamic function call>`. These should be rare enough that
+you don't see it too often.
 
 ## Scripts
 
-`scripts/run_errorck_analysis.py` runs the common analysis pipeline and writes
-`*.db` and `*.txt` outputs into the chosen output directory:
+`scripts/run_errorck_analysis.py` runs the common analysis pipeline.
+Specifically, it first just reports all function calls, and outputs to a number
+of `all_funcs*` files (`all_funcs.txt` and `all_funcs_report.db`), then runs
+an error report on all function calls (outputting `all_report.db` and
+`all_ignored.txt` which shows all the functions in `all_report.db` with
+"ignored" handling), then runs a report on all function calls excluding the
+ones listed in the `--ignored-functions` file (outputting `report.db` and
+`ignored.txt` containing only the calls with "ignored" handling), and lastly
+runs a final report on only the notable functions (outputting
+`notable_report.db` and `notable_ignored.txt` containing only the calls with
+"ignored" handling). It can be run like so:
 
     $ scripts/run_errorck_analysis.py \
         --notable-functions notable.json \
         --ignored-functions ignore.json \
         --compdb /path/to/compile_commands.json \
+        --compile-flags /path/to/compile_flags.txt \
+        --errorck /path/to/errorck \
         --output-dir out \
         file1.c file2.c
 
+The script only analyzes files present in the compilation database; any input
+paths that are not listed in `compile_commands.json` are skipped.
+
 `scripts/list_calls.py` prints call sites from a report database by handling
-type:
+type. For example,
 
     $ scripts/list_calls.py report.db ignored
+
+will list all of the calls with the "ignored" handling type in `report.db`.
 
 ## Intended use
 

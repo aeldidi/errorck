@@ -45,6 +45,15 @@ Selection flags:
   with `handlingType = observed_non_void`. This flag cannot be combined with
   the other selection flags and does not use the functions file.
 
+Call naming:
+
+- Direct calls are named by the function.
+- Direct struct member function pointer calls (for example, `ops.foo()`) are
+  named by the member (`foo`).
+- Other indirect calls that lack a stable name are reported as
+  `<dynamic function call>` when they are included (for example, under
+  `--all-non-void` or `--list-non-void-calls`).
+
 ## Implemented checks
 
 `errorck` always emits a handling type for each watched call. If a call does

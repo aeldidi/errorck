@@ -68,6 +68,11 @@ static cl::opt<bool>
                      cl::desc("Report all non-void function calls"),
                      cl::init(false), cl::cat(Category));
 
+static cl::opt<std::string>
+    CompileFlagsPath("compile-flags",
+                     cl::desc("Path to compile_flags.txt with extra arguments"),
+                     cl::value_desc("path"), cl::cat(Category));
+
 enum class ErrorReportingType {
   kReturnValue,
   kErrno,
@@ -80,6 +85,8 @@ struct AnalysisConfig {
   bool exclude_notable = false;
   bool list_non_void_calls = false;
 };
+
+static constexpr const char kDynamicCalleeName[] = "<dynamic function call>";
 
 struct AssignedLocation {
   std::string filename;
@@ -117,6 +124,38 @@ static bool ParseErrorReportingType(llvm::StringRef value,
     return true;
   }
   return false;
+}
+
+static std::string TrimWhitespace(std::string text) {
+  const char *spaces = " \t\r\n";
+  size_t start = text.find_first_not_of(spaces);
+  if (start == std::string::npos) {
+    return "";
+  }
+  size_t end = text.find_last_not_of(spaces);
+  return text.substr(start, end - start + 1);
+}
+
+static bool ReadCompileFlagsFile(const std::string &path,
+                                 std::vector<std::string> &out,
+                                 std::string &error) {
+  std::ifstream in(path);
+  if (!in) {
+    error = "Failed to open compile flags file: " + path;
+    return false;
+  }
+  std::string line;
+  while (std::getline(in, line)) {
+    line = TrimWhitespace(line);
+    if (line.empty()) {
+      continue;
+    }
+    if (line.front() == '#') {
+      continue;
+    }
+    out.push_back(line);
+  }
+  return true;
 }
 
 static const char *HandlingTypeName(HandlingType type) {
@@ -274,6 +313,85 @@ static bool IsErrnoExpr(const clang::Expr *expr) {
   }
 
   return false;
+}
+
+struct CalleeName {
+  std::string name = kDynamicCalleeName;
+  bool stable = false;
+};
+
+static bool IsFunctionLikeType(clang::QualType type) {
+  const clang::Type *type_ptr = type.getTypePtrOrNull();
+  if (!type_ptr) {
+    return false;
+  }
+  return type_ptr->isFunctionType() || type_ptr->isFunctionPointerType();
+}
+
+static const clang::Expr *StripCalleeWrappers(const clang::Expr *expr) {
+  const clang::Expr *current = expr;
+  while (current) {
+    current = current->IgnoreParenImpCasts();
+    const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(current);
+    if (!unary || unary->getOpcode() != clang::UO_Deref) {
+      return current;
+    }
+    current = unary->getSubExpr();
+  }
+  return nullptr;
+}
+
+// We only attach stable names when the callee is directly known (function or
+// struct member). Other indirect calls keep a placeholder so reports stay
+// readable and deterministic.
+static CalleeName GetCalleeName(const clang::CallExpr *call_expr) {
+  CalleeName result;
+  if (!call_expr) {
+    return result;
+  }
+
+  if (const auto *direct = call_expr->getDirectCallee()) {
+    std::string name = direct->getNameAsString();
+    if (!name.empty()) {
+      result.name = std::move(name);
+      result.stable = true;
+      return result;
+    }
+  }
+
+  const clang::Expr *callee = StripCalleeWrappers(call_expr->getCallee());
+  if (!callee) {
+    return result;
+  }
+
+  if (!IsFunctionLikeType(callee->getType())) {
+    return result;
+  }
+
+  if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(callee)) {
+    const auto *named = member->getMemberDecl();
+    if (named) {
+      std::string name = named->getNameAsString();
+      if (!name.empty()) {
+        result.name = std::move(name);
+        result.stable = true;
+      }
+    }
+    return result;
+  }
+
+  if (const auto *decl_ref = llvm::dyn_cast<clang::DeclRefExpr>(callee)) {
+    if (const auto *decl =
+            llvm::dyn_cast<clang::FunctionDecl>(decl_ref->getDecl())) {
+      std::string name = decl->getNameAsString();
+      if (!name.empty()) {
+        result.name = std::move(name);
+        result.stable = true;
+      }
+    }
+  }
+
+  return result;
 }
 
 // Visits a statement to see if "errno" or one of it's equivalent definitions
@@ -505,11 +623,8 @@ static bool IsCallInSet(const clang::CallExpr *expr,
   if (!expr) {
     return false;
   }
-  const auto *callee = expr->getDirectCallee();
-  if (!callee) {
-    return false;
-  }
-  return names.find(callee->getNameAsString()) != names.end();
+  CalleeName callee = GetCalleeName(expr);
+  return names.find(callee.name) != names.end();
 }
 
 struct VarUsageInfo {
@@ -970,6 +1085,8 @@ public:
         handler_functions_(handler_functions),
         logger_functions_(logger_functions), writer_(writer) {}
 
+  void SetContext(clang::ASTContext &ctx) { ctx_ = &ctx; }
+
   bool TraverseStmt(clang::Stmt *S) {
     if (!S) {
       return true;
@@ -977,21 +1094,15 @@ public:
 
     if (S->getStmtClass() == clang::Stmt::CallExprClass) {
       auto *callExpr = cast<clang::CallExpr>(S);
-      auto *callExprCalleeDecl = callExpr->getCalleeDecl();
-      if (!callExprCalleeDecl ||
-          !callExprCalleeDecl->isFunctionOrFunctionTemplate()) {
+      if (!ctx_) {
         return RecursiveASTVisitor::TraverseStmt(S);
       }
 
-      auto *funcDecl = callExprCalleeDecl->getAsFunction();
-      if (!funcDecl) {
-        return RecursiveASTVisitor::TraverseStmt(S);
-      }
-
-      auto func = funcDecl->getNameAsString();
+      auto &ctx = *ctx_;
+      CalleeName callee = GetCalleeName(callExpr);
+      auto func = callee.name;
       if (analysis_config_.list_non_void_calls) {
-        if (IsNonVoidReturn(funcDecl)) {
-          auto &ctx = callExprCalleeDecl->getASTContext();
+        if (IsNonVoidReturn(callExpr, ctx)) {
           auto loc = callExpr->getExprLoc();
           auto presumedLoc = ctx.getSourceManager().getPresumedLoc(loc);
           std::string filename =
@@ -1004,11 +1115,10 @@ public:
       }
 
       ErrorReportingType reporting = ErrorReportingType::kReturnValue;
-      if (!ShouldAnalyzeCall(funcDecl, func, reporting)) {
+      if (!ShouldAnalyzeCall(callExpr, func, reporting, ctx)) {
         return RecursiveASTVisitor::TraverseStmt(S);
       }
 
-      auto &ctx = callExprCalleeDecl->getASTContext();
       HandlingResult handling;
       switch (reporting) {
       case ErrorReportingType::kReturnValue:
@@ -1035,18 +1145,19 @@ public:
   }
 
 private:
-  bool IsNonVoidReturn(const clang::FunctionDecl *func_decl) const {
-    if (!func_decl) {
+  bool IsNonVoidReturn(const clang::CallExpr *call_expr,
+                       clang::ASTContext &ctx) const {
+    if (!call_expr) {
       return false;
     }
-    const clang::Type *return_type =
-        func_decl->getReturnType().getTypePtrOrNull();
-    return return_type && !return_type->isVoidType();
+    clang::QualType return_type = call_expr->getCallReturnType(ctx);
+    const clang::Type *type_ptr = return_type.getTypePtrOrNull();
+    return type_ptr && !type_ptr->isVoidType();
   }
 
-  bool ShouldAnalyzeCall(const clang::FunctionDecl *func_decl,
-                         const std::string &name,
-                         ErrorReportingType &reporting) const {
+  bool ShouldAnalyzeCall(const clang::CallExpr *call_expr,
+                         const std::string &name, ErrorReportingType &reporting,
+                         clang::ASTContext &ctx) const {
     auto notable_it = notable_functions_.find(name);
     bool is_notable = notable_it != notable_functions_.end();
     if (analysis_config_.exclude_notable &&
@@ -1057,12 +1168,7 @@ private:
     }
 
     if (analysis_config_.analyze_all_non_void) {
-      if (!func_decl) {
-        return false;
-      }
-      const clang::Type *return_type =
-          func_decl->getReturnType().getTypePtrOrNull();
-      if (!return_type || return_type->isVoidType()) {
+      if (!IsNonVoidReturn(call_expr, ctx)) {
         return false;
       }
       // When analyzing every non-void function, default to return-value
@@ -2055,6 +2161,7 @@ private:
   const std::unordered_set<std::string> &handler_functions_;
   const std::unordered_set<std::string> &logger_functions_;
   SqliteWriter &writer_;
+  clang::ASTContext *ctx_ = nullptr;
 };
 
 class ErrorCheckConsumer : public clang::ASTConsumer {
@@ -2068,6 +2175,7 @@ public:
                 logger_functions, writer) {}
 
   virtual void HandleTranslationUnit(clang::ASTContext &Context) {
+    Visitor.SetContext(Context);
     Visitor.TraverseDecl(Context.getTranslationUnitDecl());
   }
 
@@ -2194,6 +2302,14 @@ int main(int argc, const char **argv) {
     return EXIT_FAILURE;
   }
 
+  std::vector<std::string> extra_compile_flags;
+  if (!CompileFlagsPath.empty()) {
+    if (!ReadCompileFlagsFile(CompileFlagsPath, extra_compile_flags, error)) {
+      llvm::errs() << error << "\n";
+      return EXIT_FAILURE;
+    }
+  }
+
   SqliteWriter writer;
   if (!writer.Open(DatabasePath, OverwriteIfNeeded, error)) {
     llvm::errs() << error << "\n";
@@ -2213,6 +2329,31 @@ int main(int argc, const char **argv) {
     const std::string ResourceArg = "-resource-dir=" + ResourceDir;
     Tool.appendArgumentsAdjuster(getInsertArgumentAdjuster(
         ResourceArg.c_str(), ArgumentInsertPosition::BEGIN));
+  }
+  if (!extra_compile_flags.empty()) {
+    // Insert extra flags before the source file so they are treated as options
+    // even when the compile command terminates options with "--".
+    Tool.appendArgumentsAdjuster(
+        [extra_compile_flags](const CommandLineArguments &args,
+                              StringRef filename) {
+          CommandLineArguments adjusted = args;
+          size_t insert_at = adjusted.size();
+          for (size_t i = 0; i < adjusted.size(); ++i) {
+            if (adjusted[i] == "--") {
+              insert_at = i;
+              break;
+            }
+            if (!filename.empty() && adjusted[i] == filename) {
+              insert_at = i;
+              break;
+            }
+          }
+          adjusted.insert(
+              adjusted.begin() +
+                  static_cast<CommandLineArguments::difference_type>(insert_at),
+              extra_compile_flags.begin(), extra_compile_flags.end());
+          return adjusted;
+        });
   }
   ErrorCheckActionFactory factory(notable_functions, analysis_config,
                                   handler_functions, logger_functions, writer);

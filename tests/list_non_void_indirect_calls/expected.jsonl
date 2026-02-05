@@ -1,0 +1,3 @@
+{"name":"foo","filename":"main.c","line":"13","column":"3","handlingType":"observed_non_void"}
+{"name":"get_fn","filename":"main.c","line":"14","column":"12","handlingType":"observed_non_void"}
+{"name":"<dynamic function call>","filename":"main.c","line":"15","column":"3","handlingType":"observed_non_void"}
