@@ -30,15 +30,39 @@ Example:
 ]
 ```
 
+Selection flags:
+
+- Default: only functions listed with a `reporting` entry are analyzed, using
+  their specified reporting style.
+- `--all-non-void`: analyze every call whose callee returns a non-void type
+  using return-value handling. The functions file is optional and only parsed
+  when present for handler/logger entries.
+- `--exclude-notable-functions`: treat every `name` entry in the functions
+  file (including handler/logger entries) as an exclusion list. All other
+  non-void functions are analyzed with return-value handling. This flag
+  requires `--notable-functions` and cannot be combined with `--all-non-void`.
+- `--list-non-void-calls`: report every unique non-void-returning function call
+  with `handlingType = observed_non_void`. This flag cannot be combined with
+  the other selection flags and does not use the functions file.
+
 ## Implemented checks
 
 `errorck` always emits a handling type for each watched call. If a call does
 not match any specific category, it is reported as `used_other`. The meaning
 depends on the function’s `reporting` setting.
 
-`errorck` reports nine handling types: `ignored`, `cast_to_void`,
-`assigned_not_read`, `branched_no_catchall`, `branched_with_catchall`,
-`propagated`, `passed_to_handler_fn`, `used_other`, and `logged_not_handled`.
+`errorck` reports nine handling types in the default analysis:
+`ignored`, `cast_to_void`, `assigned_not_read`, `branched_no_catchall`,
+`branched_with_catchall`, `propagated`, `passed_to_handler_fn`, `used_other`,
+and `logged_not_handled`. The `--list-non-void-calls` mode emits
+`observed_non_void`.
+
+`errorck` deduplicates output rows by `(name, filename, line, column,
+handling_type)` within a run. When the same call site is encountered more than
+once (for example, because a header was included multiple times), only the
+first row is retained.
+The SQLite output enforces this uniqueness with a unique index so duplicate
+rows are ignored even when multiple translation units are analyzed together.
 
 Precedence notes:
 

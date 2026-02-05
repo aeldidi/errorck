@@ -54,8 +54,10 @@ the handling into one of the following categories:
     logged_not_handled
     	The return value is logged but not otherwise handled.
 
-`errorck` always emits a row for each watched call. There is no pass/fail
-classification; interpretation is deferred to later analysis.
+`errorck` emits a row for each watched call site. Duplicate rows (same name,
+filename, line, column, and handling type) are dropped within a run and the
+SQLite output enforces this uniqueness. There is no pass/fail classification;
+interpretation is deferred to later analysis.
 
 ## Trivial wrapper detection
 
@@ -104,6 +106,27 @@ then build using `ninja`.
     $ `errorck` --notable-functions /path/to/functions.json \
         --db results.sqlite -p /path/to/build file1.c file2.cpp ...
 
+Additional selection examples:
+
+    $ `errorck` --all-non-void \
+        --db results.sqlite -p /path/to/build file1.c file2.cpp ...
+
+    $ `errorck` --exclude-notable-functions \
+        --notable-functions /path/to/functions.json \
+        --db results.sqlite -p /path/to/build file1.c file2.cpp ...
+
+    $ `errorck` --list-non-void-calls \
+        --db results.sqlite -p /path/to/build file1.c file2.cpp ...
+
+`--all-non-void` analyzes every call whose callee returns a non-void type using
+return-value handling and does not require `--notable-functions` (though it can
+still be provided to supply handler/logger names). `--exclude-notable-functions`
+treats the functions file as a blacklist, requires `--notable-functions`, and
+cannot be combined with `--all-non-void`.
+`--list-non-void-calls` only reports unique non-void-returning function calls,
+stores them with `handlingType = observed_non_void`, and cannot be combined
+with the other selection flags.
+
 The functions file is a JSON array. Entries describing error-reporting
 functions include `name` and `reporting` (either `return_value` or `errno`).
 Handler functions use `name` with `"type": "handler"` and omit `reporting`.
@@ -121,6 +144,23 @@ columns: `name`, `filename`, `line`, `column`, `handling_type`, and optional
 
 Test directories are descriptive (no pass/fail prefix). Every test is expected
 to produce at least one row in the output database.
+
+## Scripts
+
+`scripts/run_errorck_analysis.py` runs the common analysis pipeline and writes
+`*.db` and `*.txt` outputs into the chosen output directory:
+
+    $ scripts/run_errorck_analysis.py \
+        --notable-functions notable.json \
+        --ignored-functions ignore.json \
+        --compdb /path/to/compile_commands.json \
+        --output-dir out \
+        file1.c file2.c
+
+`scripts/list_calls.py` prints call sites from a report database by handling
+type:
+
+    $ scripts/list_calls.py report.db ignored
 
 ## Intended use
 

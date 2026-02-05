@@ -271,20 +271,83 @@ static bool ReadDatabaseOutput(const fs::path &db_path, std::string &out,
   return true;
 }
 
+static std::string Trim(std::string text) {
+  const char *spaces = " \t\r\n";
+  size_t start = text.find_first_not_of(spaces);
+  if (start == std::string::npos) {
+    return "";
+  }
+  size_t end = text.find_last_not_of(spaces);
+  return text.substr(start, end - start + 1);
+}
+
 static std::vector<std::string> ReadCompileFlags(const fs::path &path) {
   std::ifstream in(path);
   std::vector<std::string> flags;
   std::string line;
   while (std::getline(in, line)) {
+    line = Trim(line);
     if (line.empty()) {
       continue;
     }
-    if (!line.empty() && line.front() == '#') {
+    if (line.front() == '#') {
       continue;
     }
     flags.push_back(line);
   }
   return flags;
+}
+
+static std::vector<std::string> ReadErrorckArgs(const fs::path &path) {
+  std::ifstream in(path);
+  std::vector<std::string> args;
+  std::string line;
+  while (std::getline(in, line)) {
+    line = Trim(line);
+    if (line.empty()) {
+      continue;
+    }
+    if (line.front() == '#') {
+      continue;
+    }
+    args.push_back(line);
+  }
+  return args;
+}
+
+static bool ReadSources(const fs::path &test_dir,
+                        std::vector<fs::path> &sources, std::string &error) {
+  std::error_code ec;
+  fs::path sources_path = test_dir / "sources.txt";
+  if (!fs::exists(sources_path, ec)) {
+    sources.push_back(test_dir / "main.c");
+    return true;
+  }
+
+  std::ifstream in(sources_path);
+  if (!in) {
+    error = "Failed to read sources.txt in " + test_dir.string();
+    return false;
+  }
+
+  std::string line;
+  while (std::getline(in, line)) {
+    line = Trim(line);
+    if (line.empty()) {
+      continue;
+    }
+    if (line.front() == '#') {
+      continue;
+    }
+    sources.push_back(test_dir / line);
+  }
+
+  if (sources.empty()) {
+    error = "sources.txt did not list any sources in " + test_dir.string();
+    return false;
+  }
+
+  return true;
 }
 
 static std::string EscapeJson(const std::string &text) {
@@ -318,21 +381,30 @@ static std::string EscapeJson(const std::string &text) {
 
 static bool WriteCompileCommands(const fs::path &output_dir,
                                  const fs::path &test_dir,
-                                 const std::vector<std::string> &flags) {
+                                 const std::vector<std::string> &flags,
+                                 const std::vector<fs::path> &sources) {
   // ClangTool matches compile commands against absolute source paths.
   fs::path directory = WeaklyCanonical(test_dir);
-  fs::path source_path = WeaklyCanonical(test_dir / "main.c");
   std::ostringstream json;
-  json << "[\n  {\n";
-  json << "    \"directory\": \"" << EscapeJson(directory.string()) << "\",\n";
-  json << "    \"file\": \"" << EscapeJson(source_path.string()) << "\",\n";
-  json << "    \"arguments\": [";
-  json << "\"clang\"";
-  for (const std::string &flag : flags) {
-    json << ", \"" << EscapeJson(flag) << "\"";
+  json << "[\n";
+  for (size_t i = 0; i < sources.size(); ++i) {
+    fs::path source_path = WeaklyCanonical(sources[i]);
+    if (i > 0) {
+      json << ",\n";
+    }
+    json << "  {\n";
+    json << "    \"directory\": \"" << EscapeJson(directory.string())
+         << "\",\n";
+    json << "    \"file\": \"" << EscapeJson(source_path.string()) << "\",\n";
+    json << "    \"arguments\": [";
+    json << "\"clang\"";
+    for (const std::string &flag : flags) {
+      json << ", \"" << EscapeJson(flag) << "\"";
+    }
+    json << ", \"-c\", \"" << EscapeJson(source_path.string()) << "\"";
+    json << "]\n  }";
   }
-  json << ", \"-c\", \"" << EscapeJson(source_path.string()) << "\"";
-  json << "]\n  }\n]\n";
+  json << "\n]\n";
 
   fs::path output_path = output_dir / "compile_commands.json";
   return WriteFile(output_path, json.str());
@@ -406,15 +478,11 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  fs::path main_path = test_dir / "main.c";
   fs::path flags_path = test_dir / "compile_flags.txt";
   fs::path expected_path = test_dir / "expected.jsonl";
   fs::path notable_path = test_dir / "functions.json";
+  fs::path args_path = test_dir / "errorck_args.txt";
 
-  if (!fs::exists(main_path, ec)) {
-    std::cerr << "Missing main.c in " << test_dir << "\n";
-    return 1;
-  }
   if (!fs::exists(flags_path, ec)) {
     std::cerr << "Missing compile_flags.txt in " << test_dir << "\n";
     return 1;
@@ -423,12 +491,68 @@ int main(int argc, char **argv) {
     std::cerr << "Missing expected.jsonl in " << test_dir << "\n";
     return 1;
   }
-  if (!fs::exists(notable_path, ec)) {
-    std::cerr << "Missing functions.json in " << test_dir << "\n";
+
+  std::vector<fs::path> sources;
+  std::string sources_error;
+  if (!ReadSources(test_dir, sources, sources_error)) {
+    std::cerr << sources_error << "\n";
     return 1;
+  }
+  for (const auto &source : sources) {
+    if (!fs::exists(source, ec)) {
+      std::cerr << "Missing source file " << source << " in " << test_dir
+                << "\n";
+      return 1;
+    }
   }
 
   std::vector<std::string> flags = ReadCompileFlags(flags_path);
+  std::vector<std::string> extra_args;
+  if (fs::exists(args_path, ec)) {
+    extra_args = ReadErrorckArgs(args_path);
+  } else if (ec) {
+    std::cerr << "Failed to stat " << args_path << "\n";
+    return 1;
+  }
+
+  bool has_all_non_void = false;
+  bool has_exclude = false;
+  bool has_list_non_void = false;
+  for (const auto &arg : extra_args) {
+    if (arg == "--all-non-void") {
+      has_all_non_void = true;
+    } else if (arg == "--exclude-notable-functions") {
+      has_exclude = true;
+    } else if (arg == "--list-non-void-calls") {
+      has_list_non_void = true;
+    }
+  }
+  if ((has_all_non_void && has_exclude) ||
+      (has_list_non_void && (has_all_non_void || has_exclude))) {
+    std::cerr << "Invalid errorck_args.txt: incompatible errorck flags.\n";
+    return 1;
+  }
+
+  bool has_notable = fs::exists(notable_path, ec);
+  if (ec) {
+    std::cerr << "Failed to stat " << notable_path << "\n";
+    return 1;
+  }
+  if (has_list_non_void && has_notable) {
+    std::cerr << "functions.json should not be present for " << test_dir
+              << " when using --list-non-void-calls.\n";
+    return 1;
+  }
+  if (!has_notable) {
+    if (has_exclude) {
+      std::cerr << "Missing functions.json in " << test_dir << "\n";
+      return 1;
+    }
+    if (!has_all_non_void && !has_list_non_void) {
+      std::cerr << "Missing functions.json in " << test_dir << "\n";
+      return 1;
+    }
+  }
   fs::path test_build_dir = build_dir / "tests" / test_dir.filename();
   fs::create_directories(test_build_dir, ec);
   if (ec) {
@@ -436,22 +560,26 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (!WriteCompileCommands(test_build_dir, test_dir, flags)) {
+  if (!WriteCompileCommands(test_build_dir, test_dir, flags, sources)) {
     std::cerr << "Failed to write compile_commands.json for " << test_dir
               << "\n";
     return 1;
   }
 
   fs::path db_path = test_build_dir / "results.sqlite";
-  std::vector<std::string> command = {errorck_path.string(),
-                                      "--notable-functions",
-                                      notable_path.string(),
-                                      "--db",
-                                      db_path.string(),
-                                      "--overwrite-if-needed",
-                                      "-p",
-                                      test_build_dir.string(),
-                                      main_path.string()};
+  std::vector<std::string> command = {
+    errorck_path.string(),   "--db", db_path.string(),
+    "--overwrite-if-needed", "-p",   test_build_dir.string()};
+  if (has_notable) {
+    command.push_back("--notable-functions");
+    command.push_back(notable_path.string());
+  }
+  for (const auto &arg : extra_args) {
+    command.push_back(arg);
+  }
+  for (const auto &source : sources) {
+    command.push_back(source.string());
+  }
   CommandResult result = RunCommand(command);
   if (result.exit_code != 0) {
     std::cerr << "errorck failed for " << test_dir << " (exit "

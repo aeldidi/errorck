@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -38,9 +39,10 @@ using namespace llvm;
 
 static cl::OptionCategory Category("errorck options");
 
-static cl::opt<std::string> NotableFunctionsPath(
-    "notable-functions", cl::desc("Path to JSON array of functions to watch"),
-    cl::value_desc("path"), cl::Required, cl::cat(Category));
+static cl::opt<std::string>
+    NotableFunctionsPath("notable-functions",
+                         cl::desc("Path to JSON array of functions to watch"),
+                         cl::value_desc("path"), cl::cat(Category));
 
 static cl::opt<std::string>
     DatabasePath("db", cl::desc("Path to SQLite database output"),
@@ -51,12 +53,33 @@ static cl::opt<bool>
                       cl::desc("Allow overwriting an existing database"),
                       cl::init(false), cl::cat(Category));
 
+static cl::opt<bool>
+    AnalyzeAllNonVoid("all-non-void",
+                      cl::desc("Analyze all non-void functions"),
+                      cl::init(false), cl::cat(Category));
+
+static cl::opt<bool> ExcludeNotableFunctions(
+    "exclude-notable-functions",
+    cl::desc("Treat --notable-functions as an exclusion list"), cl::init(false),
+    cl::cat(Category));
+
+static cl::opt<bool>
+    ListNonVoidCalls("list-non-void-calls",
+                     cl::desc("Report all non-void function calls"),
+                     cl::init(false), cl::cat(Category));
+
 enum class ErrorReportingType {
   kReturnValue,
   kErrno,
 };
 
 using NotableFunctions = std::unordered_map<std::string, ErrorReportingType>;
+
+struct AnalysisConfig {
+  bool analyze_all_non_void = false;
+  bool exclude_notable = false;
+  bool list_non_void_calls = false;
+};
 
 struct AssignedLocation {
   std::string filename;
@@ -75,6 +98,7 @@ enum class HandlingType {
   kPassedToHandlerFn,
   kUsedOther,
   kLoggedNotHandled,
+  kObservedNonVoid,
 };
 
 struct HandlingResult {
@@ -115,6 +139,8 @@ static const char *HandlingTypeName(HandlingType type) {
     return "used_other";
   case HandlingType::kLoggedNotHandled:
     return "logged_not_handled";
+  case HandlingType::kObservedNonVoid:
+    return "observed_non_void";
   case HandlingType::kNone:
     return "";
   }
@@ -700,6 +726,37 @@ AnalyzeErrnoUsage(const clang::Stmt *stmt,
 }
 
 class SqliteWriter {
+  struct CallKey {
+    std::string name;
+    std::string filename;
+    unsigned line = 0;
+    unsigned column = 0;
+    std::string handling_type;
+
+    bool operator==(const CallKey &other) const {
+      return name == other.name && filename == other.filename &&
+             line == other.line && column == other.column &&
+             handling_type == other.handling_type;
+    }
+  };
+
+  struct CallKeyHash {
+    size_t operator()(const CallKey &key) const {
+      size_t seed = 0;
+      seed ^= std::hash<std::string>{}(key.name) + 0x9e3779b9 + (seed << 6) +
+              (seed >> 2);
+      seed ^= std::hash<std::string>{}(key.filename) + 0x9e3779b9 +
+              (seed << 6) + (seed >> 2);
+      seed ^= std::hash<unsigned>{}(key.line) + 0x9e3779b9 + (seed << 6) +
+              (seed >> 2);
+      seed ^= std::hash<unsigned>{}(key.column) + 0x9e3779b9 + (seed << 6) +
+              (seed >> 2);
+      seed ^= std::hash<std::string>{}(key.handling_type) + 0x9e3779b9 +
+              (seed << 6) + (seed >> 2);
+      return seed;
+    }
+  };
+
 public:
   ~SqliteWriter() {
     if (insert_stmt_) {
@@ -770,6 +827,21 @@ public:
       return false;
     }
 
+    // Enforce uniqueness in the database so duplicate call sites across
+    // translation units are ignored consistently.
+    const char *unique_sql =
+        "CREATE UNIQUE INDEX IF NOT EXISTS watched_calls_unique "
+        "ON watched_calls (name, filename, line, column, handling_type);";
+    rc = sqlite3_exec(db_, unique_sql, nullptr, nullptr, &errmsg);
+    if (rc != SQLITE_OK) {
+      error = "Failed to initialize uniqueness index: " +
+              std::string(errmsg ? errmsg : sqlite3_errmsg(db_));
+      sqlite3_free(errmsg);
+      sqlite3_close(db_);
+      db_ = nullptr;
+      return false;
+    }
+
     // Keep results deterministic when reusing a database path across runs.
     rc = sqlite3_exec(db_, "DELETE FROM watched_calls;", nullptr, nullptr,
                       &errmsg);
@@ -783,7 +855,7 @@ public:
     }
 
     const char *insert_sql =
-        "INSERT INTO watched_calls (name, filename, line, column, "
+        "INSERT OR IGNORE INTO watched_calls (name, filename, line, column, "
         "handling_type, assigned_filename, assigned_line, assigned_column) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?);";
     rc = sqlite3_prepare_v2(db_, insert_sql, -1, &insert_stmt_, nullptr);
@@ -796,6 +868,7 @@ public:
       return false;
     }
 
+    seen_calls_.clear();
     return true;
   }
 
@@ -805,6 +878,13 @@ public:
                   const std::optional<AssignedLocation> &assigned) {
     if (!error_message_.empty()) {
       return false;
+    }
+
+    CallKey key{name, filename, line, column, handling_type};
+    // Avoid double-counting when the same location is seen multiple times
+    // (e.g. headers included repeatedly).
+    if (seen_calls_.find(key) != seen_calls_.end()) {
+      return true;
     }
 
     if (sqlite3_bind_text(insert_stmt_, 1, name.c_str(), -1,
@@ -854,6 +934,7 @@ public:
       return false;
     }
 
+    seen_calls_.insert(std::move(key));
     sqlite3_reset(insert_stmt_);
     sqlite3_clear_bindings(insert_stmt_);
     return true;
@@ -873,16 +954,19 @@ private:
 
   sqlite3 *db_ = nullptr;
   sqlite3_stmt *insert_stmt_ = nullptr;
+  std::unordered_set<CallKey, CallKeyHash> seen_calls_;
   std::string error_message_;
 };
 
 class ErrorCheckVisitor : public clang::RecursiveASTVisitor<ErrorCheckVisitor> {
 public:
   ErrorCheckVisitor(const NotableFunctions &notable_functions,
+                    const AnalysisConfig &analysis_config,
                     const std::unordered_set<std::string> &handler_functions,
                     const std::unordered_set<std::string> &logger_functions,
                     SqliteWriter &writer)
       : notable_functions_(notable_functions),
+        analysis_config_(analysis_config),
         handler_functions_(handler_functions),
         logger_functions_(logger_functions), writer_(writer) {}
 
@@ -905,14 +989,28 @@ public:
       }
 
       auto func = funcDecl->getNameAsString();
-      auto notable_it = notable_functions_.find(func);
-      if (notable_it == notable_functions_.end()) {
+      if (analysis_config_.list_non_void_calls) {
+        if (IsNonVoidReturn(funcDecl)) {
+          auto &ctx = callExprCalleeDecl->getASTContext();
+          auto loc = callExpr->getExprLoc();
+          auto presumedLoc = ctx.getSourceManager().getPresumedLoc(loc);
+          std::string filename =
+              presumedLoc.getFilename() ? presumedLoc.getFilename() : "";
+          writer_.InsertCall(
+              func, filename, presumedLoc.getLine(), presumedLoc.getColumn(),
+              HandlingTypeName(HandlingType::kObservedNonVoid), std::nullopt);
+        }
+        return RecursiveASTVisitor::TraverseStmt(S);
+      }
+
+      ErrorReportingType reporting = ErrorReportingType::kReturnValue;
+      if (!ShouldAnalyzeCall(funcDecl, func, reporting)) {
         return RecursiveASTVisitor::TraverseStmt(S);
       }
 
       auto &ctx = callExprCalleeDecl->getASTContext();
       HandlingResult handling;
-      switch (notable_it->second) {
+      switch (reporting) {
       case ErrorReportingType::kReturnValue:
         handling = AnalyzeReturnValue(callExpr, ctx);
         break;
@@ -937,6 +1035,49 @@ public:
   }
 
 private:
+  bool IsNonVoidReturn(const clang::FunctionDecl *func_decl) const {
+    if (!func_decl) {
+      return false;
+    }
+    const clang::Type *return_type =
+        func_decl->getReturnType().getTypePtrOrNull();
+    return return_type && !return_type->isVoidType();
+  }
+
+  bool ShouldAnalyzeCall(const clang::FunctionDecl *func_decl,
+                         const std::string &name,
+                         ErrorReportingType &reporting) const {
+    auto notable_it = notable_functions_.find(name);
+    bool is_notable = notable_it != notable_functions_.end();
+    if (analysis_config_.exclude_notable &&
+        (is_notable ||
+         handler_functions_.find(name) != handler_functions_.end() ||
+         logger_functions_.find(name) != logger_functions_.end())) {
+      return false;
+    }
+
+    if (analysis_config_.analyze_all_non_void) {
+      if (!func_decl) {
+        return false;
+      }
+      const clang::Type *return_type =
+          func_decl->getReturnType().getTypePtrOrNull();
+      if (!return_type || return_type->isVoidType()) {
+        return false;
+      }
+      // When analyzing every non-void function, default to return-value
+      // handling because errno usage cannot be inferred from signatures.
+      reporting = ErrorReportingType::kReturnValue;
+      return true;
+    }
+
+    if (!is_notable) {
+      return false;
+    }
+    reporting = notable_it->second;
+    return true;
+  }
+
   const clang::Expr *TopLevelExpr(const clang::Expr *expr,
                                   clang::ASTContext &ctx) const {
     if (!expr) {
@@ -1910,6 +2051,7 @@ private:
   }
 
   const NotableFunctions &notable_functions_;
+  AnalysisConfig analysis_config_;
   const std::unordered_set<std::string> &handler_functions_;
   const std::unordered_set<std::string> &logger_functions_;
   SqliteWriter &writer_;
@@ -1918,11 +2060,12 @@ private:
 class ErrorCheckConsumer : public clang::ASTConsumer {
 public:
   ErrorCheckConsumer(const NotableFunctions &notable_functions,
+                     const AnalysisConfig &analysis_config,
                      const std::unordered_set<std::string> &handler_functions,
                      const std::unordered_set<std::string> &logger_functions,
                      SqliteWriter &writer)
-      : Visitor(notable_functions, handler_functions, logger_functions,
-                writer) {}
+      : Visitor(notable_functions, analysis_config, handler_functions,
+                logger_functions, writer) {}
 
   virtual void HandleTranslationUnit(clang::ASTContext &Context) {
     Visitor.TraverseDecl(Context.getTranslationUnitDecl());
@@ -1935,21 +2078,25 @@ private:
 class ErrorCheckAction : public clang::ASTFrontendAction {
 public:
   ErrorCheckAction(const NotableFunctions &notable_functions,
+                   const AnalysisConfig &analysis_config,
                    const std::unordered_set<std::string> &handler_functions,
                    const std::unordered_set<std::string> &logger_functions,
                    SqliteWriter &writer)
       : notable_functions_(notable_functions),
+        analysis_config_(analysis_config),
         handler_functions_(handler_functions),
         logger_functions_(logger_functions), writer_(writer) {}
 
   virtual std::unique_ptr<clang::ASTConsumer>
   CreateASTConsumer(clang::CompilerInstance &, StringRef) {
     return std::make_unique<ErrorCheckConsumer>(
-        notable_functions_, handler_functions_, logger_functions_, writer_);
+        notable_functions_, analysis_config_, handler_functions_,
+        logger_functions_, writer_);
   }
 
 private:
   const NotableFunctions &notable_functions_;
+  AnalysisConfig analysis_config_;
   const std::unordered_set<std::string> &handler_functions_;
   const std::unordered_set<std::string> &logger_functions_;
   SqliteWriter &writer_;
@@ -1959,20 +2106,24 @@ class ErrorCheckActionFactory : public clang::tooling::FrontendActionFactory {
 public:
   ErrorCheckActionFactory(
       const NotableFunctions &notable_functions,
+      const AnalysisConfig &analysis_config,
       const std::unordered_set<std::string> &handler_functions,
       const std::unordered_set<std::string> &logger_functions,
       SqliteWriter &writer)
       : notable_functions_(notable_functions),
+        analysis_config_(analysis_config),
         handler_functions_(handler_functions),
         logger_functions_(logger_functions), writer_(writer) {}
 
   std::unique_ptr<clang::FrontendAction> create() override {
     return std::make_unique<ErrorCheckAction>(
-        notable_functions_, handler_functions_, logger_functions_, writer_);
+        notable_functions_, analysis_config_, handler_functions_,
+        logger_functions_, writer_);
   }
 
 private:
   const NotableFunctions &notable_functions_;
+  AnalysisConfig analysis_config_;
   const std::unordered_set<std::string> &handler_functions_;
   const std::unordered_set<std::string> &logger_functions_;
   SqliteWriter &writer_;
@@ -1997,12 +2148,48 @@ int main(int argc, const char **argv) {
     return EXIT_FAILURE;
   }
 
+  AnalysisConfig analysis_config;
+  analysis_config.list_non_void_calls = ListNonVoidCalls;
+  if (ListNonVoidCalls) {
+    if (AnalyzeAllNonVoid || ExcludeNotableFunctions) {
+      llvm::errs() << "--list-non-void-calls is not compatible with "
+                      "--all-non-void or --exclude-notable-functions.\n";
+      return EXIT_FAILURE;
+    }
+    if (!NotableFunctionsPath.empty()) {
+      llvm::errs() << "--list-non-void-calls cannot be combined with "
+                      "--notable-functions.\n";
+      return EXIT_FAILURE;
+    }
+  } else {
+    analysis_config.analyze_all_non_void =
+        AnalyzeAllNonVoid || ExcludeNotableFunctions;
+    analysis_config.exclude_notable = ExcludeNotableFunctions;
+    if (AnalyzeAllNonVoid && ExcludeNotableFunctions) {
+      llvm::errs() << "--all-non-void is not compatible with "
+                      "--exclude-notable-functions.\n";
+      return EXIT_FAILURE;
+    }
+  }
+
   NotableFunctions notable_functions;
   std::unordered_set<std::string> handler_functions;
   std::unordered_set<std::string> logger_functions;
   std::string error;
-  if (!LoadNotableFunctions(NotableFunctionsPath, notable_functions,
-                            handler_functions, logger_functions, error)) {
+  if (NotableFunctionsPath.empty()) {
+    if (ExcludeNotableFunctions) {
+      llvm::errs() << "--exclude-notable-functions requires "
+                      "--notable-functions.\n";
+      return EXIT_FAILURE;
+    }
+    if (!AnalyzeAllNonVoid && !ListNonVoidCalls) {
+      llvm::errs() << "--notable-functions is required unless "
+                      "--all-non-void or --list-non-void-calls is set.\n";
+      return EXIT_FAILURE;
+    }
+  } else if (!LoadNotableFunctions(NotableFunctionsPath, notable_functions,
+                                   handler_functions, logger_functions,
+                                   error)) {
     llvm::errs() << error << "\n";
     return EXIT_FAILURE;
   }
@@ -2027,8 +2214,8 @@ int main(int argc, const char **argv) {
     Tool.appendArgumentsAdjuster(getInsertArgumentAdjuster(
         ResourceArg.c_str(), ArgumentInsertPosition::BEGIN));
   }
-  ErrorCheckActionFactory factory(notable_functions, handler_functions,
-                                  logger_functions, writer);
+  ErrorCheckActionFactory factory(notable_functions, analysis_config,
+                                  handler_functions, logger_functions, writer);
   int result = Tool.run(&factory);
   if (!writer.ok()) {
     llvm::errs() << writer.error_message() << "\n";
